@@ -206,7 +206,7 @@ def garmin_query(sql: str, limit: int = 1000) -> str:
         clamped = max(1, min(limit, 10000))
         rows = query_readonly(sql, limit=clamped)
         return json.dumps(rows, separators=(",", ":"), default=str)
-    except Exception as exc:
+    except Exception:
         log.exception("garmin_query failed")
         return json.dumps({"error": "Query failed. Check that your SQL is a valid SELECT statement."})
 
@@ -739,7 +739,6 @@ def garmin_today() -> str:
     Ideal as conversation context — call this first to ground any health question.
     """
     today = str(date.today())
-    yesterday = str(date.today() - timedelta(days=1))
     conn = get_connection()
     try:
         daily = query(

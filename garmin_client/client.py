@@ -463,6 +463,7 @@ class GarminClient:
         # Poll until we leave SSO
         max_polls = timeout_ms // 1000
         mfa_prompted = False
+        mfa_submitted = False
         mfa_code_thread = None
         mfa_code_result = [None]
 
@@ -550,7 +551,7 @@ class GarminClient:
             if mfa_prompted and poll % 15 == 0 and poll > 0:
                 print("  Still waiting for MFA code...")
 
-            if mfa_prompted and poll > 0 and poll % 30 == 0:
+            if mfa_submitted and poll > 0 and poll % 30 == 0:
                 log.debug("Stuck on SSO after MFA — trying to navigate to app...")
                 try:
                     self._driver.get(CONNECT_URL)
@@ -567,6 +568,7 @@ class GarminClient:
                 mfa_code_result[0] = None
                 log.info("MFA code from console (%d chars), submitting...", len(code))
                 self._submit_mfa_code(code)
+                mfa_submitted = True
 
         # Wait for app to load
         time.sleep(3)
@@ -617,6 +619,15 @@ class GarminClient:
             except Exception:
                 continue
 
+        try:
+            inputs_dump = self._driver.execute_script(
+                "return Array.from(document.querySelectorAll('input')).map(function(i){"
+                "return {name:i.name,id:i.id,type:i.type,placeholder:i.placeholder,"
+                "autocomplete:i.autocomplete,visible:i.offsetParent!==null};});"
+            )
+            log.warning("MFA input field dump: %s", inputs_dump)
+        except Exception as e:
+            log.debug("MFA input dump failed: %s", e)
         log.warning("Could not find MFA input field to fill")
 
     def _is_on_login_page(self) -> bool:

@@ -25,3 +25,4 @@ garmin_session.json
 .codex
 .codex/
 downloaded_files/
+.DS_Store

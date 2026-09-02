@@ -162,16 +162,24 @@ def fetch_direct_to_db(
         )
     else:
         # Calculate total chunks for progress reporting
+        #
+        # NOTE: this must be `>=`, not `>`. A calendar year is 365 or 366
+        # days, so `cursor - timedelta(days=365)` does not always land
+        # exactly on `s` even when the remaining span "should" divide
+        # evenly. With a strict `>` guard, whenever that happens the loop
+        # stops one iteration early and silently drops start_date itself
+        # from every chunk — reproducible whenever total_days is an exact
+        # multiple of 366 (366, 732, 1098, ...).
         total_chunks = 0
         c = e
-        while c > s:
+        while c >= s:
             total_chunks += 1
             c = max(s, c - timedelta(days=365)) - timedelta(days=1)
 
         # Chunk into yearly segments (most recent first)
         year_num = 0
         cursor = e
-        while cursor > s:
+        while cursor >= s:
             chunk_start = max(s, cursor - timedelta(days=365))
             chunk_end = cursor
 
@@ -517,7 +525,7 @@ examples:
 
     if args.full:
         mode = "full"
-        start = (today - timedelta(days=365 * 10)).isoformat()
+        start = (today - timedelta(days=365 * 3)).isoformat()
         end = today.isoformat()
     elif args.latest and not args.fit_only:
         mode = "incremental"
@@ -534,7 +542,7 @@ examples:
         end = today.isoformat()
     elif not status["exists"] or status["rows"] == 0:
         mode = "full"
-        start = (today - timedelta(days=365 * 10)).isoformat()
+        start = (today - timedelta(days=365 * 3)).isoformat()
         end = today.isoformat()
         if not args.fit_only:
             print("No existing data found. Running full historical fetch...")
