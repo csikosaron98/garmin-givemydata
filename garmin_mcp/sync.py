@@ -129,6 +129,10 @@ def incremental_sync(
         logger.info("Skipping %d activities with existing details", len(known_activity_ids))
 
     counts = {}
+    # Activities whose details arrive during THIS run. known_activity_ids serves
+    # the opposite purpose — it is the set fetch_all skips — so the two must not
+    # be conflated when deciding whose trackpoints to parse.
+    newly_fetched_ids = set()
 
     def on_batch(endpoint_name, data, cal_date=None):
         n = save_to_db(conn, endpoint_name, data, cal_date=cal_date)
@@ -137,9 +141,12 @@ def incremental_sync(
         # Track newly fetched activity details so later requests skip them
         if endpoint_name == "activity_splits" and cal_date:
             try:
-                known_activity_ids.add(int(cal_date))
+                activity_id = int(cal_date)
             except (ValueError, TypeError):
                 pass
+            else:
+                known_activity_ids.add(activity_id)
+                newly_fetched_ids.add(activity_id)
 
     SESSION_FILE = PROJECT_DIR / "garmin_session.json"
     client = GarminClient(
@@ -166,9 +173,17 @@ def incremental_sync(
             save_raw=save_raw,
         )
 
-        # Parse trackpoints from local FIT files when explicitly requested.
+        # Parse trackpoints from local FIT files when explicitly requested —
+        # for the activities fetched in this run only.
+        #
+        # This used to be passed known_activity_ids, which is every activity the
+        # database has ever seen. That re-read and re-upserted the entire FIT
+        # archive on every run: ~915 000 trackpoint rows rewritten each time to
+        # add the two or three that were new, and it is what made a routine sync
+        # take about six minutes. The set was built to tell fetch_all what to
+        # SKIP; reusing it here inverted its meaning.
         if parse_trackpoints:
-            trackpoint_count = _parse_trackpoints_for_activities(conn, known_activity_ids)
+            trackpoint_count = _parse_trackpoints_for_activities(conn, newly_fetched_ids)
             if trackpoint_count > 0:
                 counts["activity_trackpoints"] = trackpoint_count
 
