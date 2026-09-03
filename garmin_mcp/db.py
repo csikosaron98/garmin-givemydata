@@ -381,7 +381,36 @@ CREATE TABLE IF NOT EXISTS training_readiness (
     stress_history_factor_feedback      TEXT,
     acwr_factor_percent                 REAL,
     acwr_factor_feedback                TEXT,
+    timestamp                           TEXT,
+    timestamp_local                     TEXT,
+    input_context                       TEXT,
     raw_json                            TEXT
+);
+
+-- Garmin publishes several readiness snapshots per day: one on waking
+-- (inputContext AFTER_WAKEUP_RESET) and further ones during the day, e.g.
+-- after an activity. training_readiness holds one row per day, so those extra
+-- snapshots used to be written over each other and, because the API returns
+-- them newest-first, the OLDEST typically survived -- leaving the morning
+-- value in place all day while the watch showed a newer one. This table keeps
+-- every snapshot; training_readiness keeps the freshest per day.
+CREATE TABLE IF NOT EXISTS training_readiness_snapshot (
+    calendar_date                       TEXT NOT NULL,
+    timestamp                           TEXT NOT NULL,
+    timestamp_local                     TEXT,
+    input_context                       TEXT,
+    score                               REAL,
+    level                               TEXT,
+    feedback_short                      TEXT,
+    feedback_long                       TEXT,
+    recovery_time                       REAL,
+    recovery_time_factor_percent        REAL,
+    hrv_factor_percent                  REAL,
+    sleep_history_factor_percent        REAL,
+    stress_history_factor_percent       REAL,
+    acwr_factor_percent                 REAL,
+    raw_json                            TEXT,
+    PRIMARY KEY (calendar_date, timestamp)
 );
 
 CREATE TABLE IF NOT EXISTS hrv (
@@ -745,6 +774,7 @@ CREATE INDEX IF NOT EXISTS idx_activity_date ON activity (start_time_local);
 CREATE INDEX IF NOT EXISTS idx_daily_date    ON daily_summary (calendar_date);
 CREATE INDEX IF NOT EXISTS idx_sleep_date    ON sleep (calendar_date);
 CREATE INDEX IF NOT EXISTS idx_tr_date       ON training_readiness (calendar_date);
+CREATE INDEX IF NOT EXISTS idx_trs_date      ON training_readiness_snapshot (calendar_date);
 CREATE INDEX IF NOT EXISTS idx_weight_date   ON weight (calendar_date);
 CREATE INDEX IF NOT EXISTS idx_hydration_date ON hydration (calendar_date);
 CREATE INDEX IF NOT EXISTS idx_heart_rate_date ON heart_rate (calendar_date);
@@ -883,6 +913,33 @@ def _backfill_from_raw(
         vals = [data.get(jk) for jk in active.values()]
         where = " AND ".join(f"{c} = ?" for c in pk_cols)
         conn.execute(f"UPDATE {table} SET {set_clause} WHERE {where}", vals + list(pk_vals))
+
+
+def migrate_training_readiness_table(conn: sqlite3.Connection) -> None:
+    """Add snapshot timestamps to training_readiness and backfill them.
+
+    Without a timestamp the table cannot tell which of a day's snapshots it is
+    holding, so an older one can silently overwrite a newer one. The values are
+    already present in every stored raw_json, so existing rows can be filled in
+    without refetching anything.
+    """
+    added = _add_columns(
+        conn,
+        "training_readiness",
+        [("timestamp", "TEXT"), ("timestamp_local", "TEXT"), ("input_context", "TEXT")],
+    )
+    if not added:
+        return
+    conn.execute(
+        """
+        UPDATE training_readiness
+           SET timestamp       = json_extract(raw_json, '$.timestamp'),
+               timestamp_local = json_extract(raw_json, '$.timestampLocal'),
+               input_context   = json_extract(raw_json, '$.inputContext')
+         WHERE raw_json IS NOT NULL
+        """
+    )
+    log.info("Backfilled training_readiness snapshot timestamps")
 
 
 def migrate_sleep_table(conn: sqlite3.Connection) -> None:
@@ -1402,6 +1459,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     migrate_fitness_age_table(conn)
     migrate_weight_table_v3(conn)
     migrate_activity_table(conn)
+    migrate_training_readiness_table(conn)
 
     # Only run cleanup/backfill when there are rows that actually need it.
     needs_cleanup = conn.execute(
@@ -2107,46 +2165,114 @@ def upsert_activity(conn: sqlite3.Connection, record: dict) -> None:
 
 
 def upsert_training_readiness(conn: sqlite3.Connection, record: dict) -> None:
+    """Store a readiness snapshot, keeping the freshest one per day.
+
+    Garmin returns several snapshots for the same day -- one taken on waking
+    and further ones during the day (after an activity, for instance) -- and
+    the range query hands them back newest-first. The previous
+    ``INSERT OR REPLACE`` let whichever arrived last win, which meant the
+    oldest, so the morning value stayed in place all day while the watch and
+    Connect showed a newer one. Every snapshot is now kept in
+    ``training_readiness_snapshot``, and the daily row only moves forward:
+    an incoming snapshot must be at least as recent as the stored one.
+    """
+    params = {
+        "calendar_date": record.get("calendarDate"),
+        "score": record.get("score"),
+        "level": record.get("level"),
+        "feedback_short": record.get("feedbackShort"),
+        "feedback_long": record.get("feedbackLong"),
+        "recovery_time": record.get("recoveryTime"),
+        "recovery_time_factor_percent": record.get("recoveryTimeFactorPercent"),
+        "recovery_time_factor_feedback": record.get("recoveryTimeFactorFeedback"),
+        "hrv_factor_percent": record.get("hrvFactorPercent"),
+        "hrv_factor_feedback": record.get("hrvFactorFeedback"),
+        "hrv_weekly_average": record.get("hrvWeeklyAverage"),
+        "sleep_history_factor_percent": record.get("sleepHistoryFactorPercent"),
+        "sleep_history_factor_feedback": record.get("sleepHistoryFactorFeedback"),
+        "stress_history_factor_percent": record.get("stressHistoryFactorPercent"),
+        "stress_history_factor_feedback": record.get("stressHistoryFactorFeedback"),
+        "acwr_factor_percent": record.get("acwrFactorPercent"),
+        "acwr_factor_feedback": record.get("acwrFactorFeedback"),
+        "timestamp": record.get("timestamp"),
+        "timestamp_local": record.get("timestampLocal"),
+        "input_context": record.get("inputContext"),
+        "raw_json": json.dumps(record),
+    }
+    if not params["calendar_date"]:
+        return
+
+    # The full series, so a day's intraday history survives and the daily row
+    # can always be recomputed from it.
+    if params["timestamp"]:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO training_readiness_snapshot (
+                calendar_date, timestamp, timestamp_local, input_context,
+                score, level, feedback_short, feedback_long, recovery_time,
+                recovery_time_factor_percent, hrv_factor_percent,
+                sleep_history_factor_percent, stress_history_factor_percent,
+                acwr_factor_percent, raw_json
+            ) VALUES (
+                :calendar_date, :timestamp, :timestamp_local, :input_context,
+                :score, :level, :feedback_short, :feedback_long, :recovery_time,
+                :recovery_time_factor_percent, :hrv_factor_percent,
+                :sleep_history_factor_percent, :stress_history_factor_percent,
+                :acwr_factor_percent, :raw_json
+            )
+            """,
+            params,
+        )
+
+    # The daily row moves forward only. A stored row without a timestamp
+    # predates this migration and is always replaced; a snapshot without one
+    # never displaces a timestamped row, since it cannot be shown to be newer.
     conn.execute(
         """
-        INSERT OR REPLACE INTO training_readiness (
+        INSERT INTO training_readiness (
             calendar_date, score, level, feedback_short, feedback_long,
             recovery_time, recovery_time_factor_percent, recovery_time_factor_feedback,
             hrv_factor_percent, hrv_factor_feedback, hrv_weekly_average,
             sleep_history_factor_percent, sleep_history_factor_feedback,
             stress_history_factor_percent, stress_history_factor_feedback,
-            acwr_factor_percent, acwr_factor_feedback, raw_json
+            acwr_factor_percent, acwr_factor_feedback,
+            timestamp, timestamp_local, input_context, raw_json
         ) VALUES (
             :calendar_date, :score, :level, :feedback_short, :feedback_long,
             :recovery_time, :recovery_time_factor_percent, :recovery_time_factor_feedback,
             :hrv_factor_percent, :hrv_factor_feedback, :hrv_weekly_average,
             :sleep_history_factor_percent, :sleep_history_factor_feedback,
             :stress_history_factor_percent, :stress_history_factor_feedback,
-            :acwr_factor_percent, :acwr_factor_feedback, :raw_json
+            :acwr_factor_percent, :acwr_factor_feedback,
+            :timestamp, :timestamp_local, :input_context, :raw_json
         )
+        ON CONFLICT(calendar_date) DO UPDATE SET
+            score                          = excluded.score,
+            level                          = excluded.level,
+            feedback_short                 = excluded.feedback_short,
+            feedback_long                  = excluded.feedback_long,
+            recovery_time                  = excluded.recovery_time,
+            recovery_time_factor_percent   = excluded.recovery_time_factor_percent,
+            recovery_time_factor_feedback  = excluded.recovery_time_factor_feedback,
+            hrv_factor_percent             = excluded.hrv_factor_percent,
+            hrv_factor_feedback            = excluded.hrv_factor_feedback,
+            hrv_weekly_average             = excluded.hrv_weekly_average,
+            sleep_history_factor_percent   = excluded.sleep_history_factor_percent,
+            sleep_history_factor_feedback  = excluded.sleep_history_factor_feedback,
+            stress_history_factor_percent  = excluded.stress_history_factor_percent,
+            stress_history_factor_feedback = excluded.stress_history_factor_feedback,
+            acwr_factor_percent            = excluded.acwr_factor_percent,
+            acwr_factor_feedback           = excluded.acwr_factor_feedback,
+            timestamp                      = excluded.timestamp,
+            timestamp_local                = excluded.timestamp_local,
+            input_context                  = excluded.input_context,
+            raw_json                       = excluded.raw_json
+        WHERE training_readiness.timestamp IS NULL
+           OR (excluded.timestamp IS NOT NULL
+               AND excluded.timestamp >= training_readiness.timestamp)
         """,
-        {
-            "calendar_date": record.get("calendarDate"),
-            "score": record.get("score"),
-            "level": record.get("level"),
-            "feedback_short": record.get("feedbackShort"),
-            "feedback_long": record.get("feedbackLong"),
-            "recovery_time": record.get("recoveryTime"),
-            "recovery_time_factor_percent": record.get("recoveryTimeFactorPercent"),
-            "recovery_time_factor_feedback": record.get("recoveryTimeFactorFeedback"),
-            "hrv_factor_percent": record.get("hrvFactorPercent"),
-            "hrv_factor_feedback": record.get("hrvFactorFeedback"),
-            "hrv_weekly_average": record.get("hrvWeeklyAverage"),
-            "sleep_history_factor_percent": record.get("sleepHistoryFactorPercent"),
-            "sleep_history_factor_feedback": record.get("sleepHistoryFactorFeedback"),
-            "stress_history_factor_percent": record.get("stressHistoryFactorPercent"),
-            "stress_history_factor_feedback": record.get("stressHistoryFactorFeedback"),
-            "acwr_factor_percent": record.get("acwrFactorPercent"),
-            "acwr_factor_feedback": record.get("acwrFactorFeedback"),
-            "raw_json": json.dumps(record),
-        },
+        params,
     )
-
 
 def upsert_hrv(conn: sqlite3.Connection, record: dict) -> None:
     baseline = record.get("baseline")
