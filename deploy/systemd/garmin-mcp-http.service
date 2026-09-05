@@ -1,0 +1,14 @@
+[Unit]
+Description=Garmin MCP HTTP server (garmin-givemydata)
+After=network.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/home/opc/garmin-givemydata
+ExecStart=/home/opc/garmin-givemydata/venv/bin/python /home/opc/garmin-givemydata/run_mcp_http.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

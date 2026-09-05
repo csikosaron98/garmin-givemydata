@@ -1,0 +1,8 @@
+[Unit]
+Description=garmin-givemydata periodic sync
+
+[Service]
+Type=oneshot
+User=opc
+WorkingDirectory=/home/opc/garmin-givemydata
+ExecStart=/home/opc/garmin-givemydata/venv/bin/python /home/opc/garmin-givemydata/garmin_givemydata.py --days 1
