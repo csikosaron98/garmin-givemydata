@@ -20,6 +20,7 @@ repo at `/home/opc/garmin-givemydata`, virtualenv at `venv/`.
 | `systemd/garmin-sync.timer` | `/etc/systemd/system/` |
 | `systemd/garmin-mcp-http.service` | `/etc/systemd/system/` |
 | `selinux/garmin_mcp_http.te` | built and loaded, see below |
+| `caddy/Caddyfile` | `/etc/caddy/Caddyfile` |
 
 ## The two pieces that are not obvious
 
@@ -62,13 +63,28 @@ sudo systemctl enable --now garmin-sync.timer garmin-mcp-http.service
 Check it: `systemctl status garmin-mcp-http.service` and
 `journalctl -u garmin-sync.service -n 50 --no-pager`.
 
-## Still not captured here
+## The whole chain, end to end
 
-`run_mcp_http.py` binds `127.0.0.1:8765`. Something in front of it terminates TLS and
-maps `https://aroncsikos.duckdns.org/mcp` onto that port — nginx or Caddy, plus the
-DuckDNS updater and whatever firewall rules open 443. **That configuration is still
-only on the VM.** It is the last single-copy piece of this system; worth collecting
-the same way this was.
+```
+claude.ai connector
+      │  https://aroncsikos.duckdns.org/mcp
+      ▼
+DuckDNS  ──►  the VM's public IP (static, an Oracle reserved address —
+      │        there is no updater scheduled, and none is needed)
+      ▼
+Caddy (:443)  ── TLS, ACME HTTP-01 ──►  reverse_proxy 127.0.0.1:8765
+      ▼
+run_mcp_http.py  ──►  garmin_mcp.server  ──►  garmin.db (SQLite, mode=ro for queries)
+```
 
-Credentials are not here and never will be: `.env` holds the Garmin login and is
-gitignored. See the FitBodAI repo's `docs/integration-credentials.md` for the rule.
+The Caddyfile is three lines and holds no secret: certificates come from the default
+HTTP-01 challenge, so no DNS API token is involved. Ports **80 and 443 must be open**
+— 80 for the ACME challenge, not only 443 — in both the OS firewall and the Oracle
+Cloud security list. That is host and cloud-console state, not a file, so it cannot
+live here.
+
+## Not captured, and why
+
+The DuckDNS hostname registration is a one-off in Áron's own DuckDNS account, and the
+Garmin credentials live in a gitignored `.env` on the VM. Neither is here and neither
+will be — see the FitBodAI repo's `docs/integration-credentials.md` for the rule.
