@@ -824,15 +824,29 @@ class TestDailyEvents:
         assert row["raw_json"] is not None
         assert json.loads(row["raw_json"])["activityType"] == "CYCLING"
 
-    def test_list_of_events_uses_first_typed_event(self, temp_db):
+    def test_list_of_events_stores_each_one(self, temp_db):
+        """Every event of the day is kept.
+
+        This used to assert the opposite — that a list collapsed to its first
+        typed event — which is the bug: a day holds several events and the table
+        kept one. See tests/test_daily_multirow.py for the full case.
+        """
         events = [
             {"duration": 60.0},
             {"activityType": "SWIMMING", "startTimestampLocal": "2026-05-08T09:00:00", "duration": 2700.0},
         ]
         upsert_daily_events(temp_db, events, cal_date="2026-05-08")
-        row = _row(temp_db, "daily_events", "calendar_date", "2026-05-08")
-        assert row["activity_type"] == "SWIMMING"
-        assert row["duration_seconds"] == pytest.approx(2700.0)
+        rows = [
+            dict(r)
+            for r in temp_db.execute(
+                "SELECT * FROM daily_events WHERE calendar_date = ? ORDER BY start_timestamp_local",
+                ("2026-05-08",),
+            )
+        ]
+        assert len(rows) == 2
+        swim = next(r for r in rows if r["activity_type"] == "SWIMMING")
+        assert swim["duration_seconds"] == pytest.approx(2700.0)
+        assert swim["start_timestamp_local"] == "2026-05-08T09:00:00"
 
 
 class TestWellnessActivity:

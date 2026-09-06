@@ -250,20 +250,31 @@ CREATE TABLE IF NOT EXISTS training_status (
 );
 
 CREATE TABLE IF NOT EXISTS health_status (
-    calendar_date       TEXT PRIMARY KEY,
+    calendar_date       TEXT NOT NULL,
+    -- Garmin reports several metrics per day (HRV, skin temperature, RHR, ...).
+    -- With calendar_date alone as the key they overwrote each other and only
+    -- whichever the API listed last survived.
+    metric_type         TEXT NOT NULL DEFAULT '',
+    status              TEXT,
+    value               REAL,
     overall_status      TEXT,
-    raw_json            TEXT
+    raw_json            TEXT,
+    PRIMARY KEY (calendar_date, metric_type)
 );
 
 CREATE TABLE IF NOT EXISTS daily_events (
-    calendar_date           TEXT PRIMARY KEY,
+    calendar_date           TEXT NOT NULL,
+    -- A day holds several events (a walk, a ride, a stress spike). The start
+    -- time is what separates them; keyed on the date alone they collapsed to
+    -- one row per day.
+    start_timestamp_local   TEXT NOT NULL DEFAULT '',
     activity_type           TEXT,
     activity_sub_type       TEXT,
-    start_timestamp_local   TEXT,
     end_timestamp_local     TEXT,
     duration_seconds        REAL,
     device_id               TEXT,
-    raw_json                TEXT
+    raw_json                TEXT,
+    PRIMARY KEY (calendar_date, start_timestamp_local)
 );
 
 CREATE TABLE IF NOT EXISTS activity_trends (
@@ -1356,6 +1367,115 @@ def migrate_hollow_tables(conn: sqlite3.Connection) -> None:
             conn.execute(f"UPDATE {table} SET {set_parts} WHERE calendar_date = ?", vals + [cal_date])
 
 
+def _pk_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({table})") if row[5]]
+
+
+def migrate_health_status_table(conn: sqlite3.Connection) -> None:
+    """Key health_status on (calendar_date, metric_type).
+
+    Garmin returns about six metrics a day. With calendar_date as the whole key
+    each one overwrote the last, and every stored row in a year-old database was
+    a SKIN_TEMP_F reading — the metric that happened to be listed last. The
+    other five were fetched, counted as saved, and thrown away.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(health_status)")}
+    if not cols or "metric_type" in cols:
+        return
+
+    log.info("Migrating health_status to one row per (day, metric)...")
+    conn.executescript(
+        """
+        ALTER TABLE health_status RENAME TO health_status_old;
+        CREATE TABLE health_status (
+            calendar_date       TEXT NOT NULL,
+            metric_type         TEXT NOT NULL DEFAULT '',
+            status              TEXT,
+            value               REAL,
+            overall_status      TEXT,
+            raw_json            TEXT,
+            PRIMARY KEY (calendar_date, metric_type)
+        );
+        INSERT OR REPLACE INTO health_status
+            (calendar_date, metric_type, status, value, overall_status, raw_json)
+        SELECT calendar_date,
+               COALESCE(json_extract(raw_json, '$.type'), ''),
+               json_extract(raw_json, '$.status'),
+               json_extract(raw_json, '$.value'),
+               overall_status,
+               raw_json
+        FROM health_status_old;
+        DROP TABLE health_status_old;
+        """
+    )
+    # Rows written by the non-gql route hold the whole {"metrics": [...]} wrapper
+    # in one row; explode those so the migrated table is uniform.
+    wrappers = conn.execute(
+        "SELECT calendar_date, raw_json FROM health_status "
+        "WHERE metric_type = '' AND json_valid(raw_json) "
+        "AND json_type(raw_json, '$.metrics') = 'array'"
+    ).fetchall()
+    for cal_date, raw in wrappers:
+        try:
+            record = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        conn.execute(
+            "DELETE FROM health_status WHERE calendar_date = ? AND metric_type = ''", (cal_date,)
+        )
+        upsert_health_status(conn, record, cal_date=cal_date)
+
+
+def migrate_daily_events_table(conn: sqlite3.Connection) -> None:
+    """Key daily_events on (calendar_date, start_timestamp_local).
+
+    Three events a day is typical and one row a day is what the schema allowed,
+    so two of every three were dropped on arrival.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(daily_events)")}
+    if not cols or len(_pk_columns(conn, "daily_events")) > 1:
+        return
+
+    log.info("Migrating daily_events to one row per event...")
+    conn.executescript(
+        """
+        ALTER TABLE daily_events RENAME TO daily_events_old;
+        CREATE TABLE daily_events (
+            calendar_date           TEXT NOT NULL,
+            start_timestamp_local   TEXT NOT NULL DEFAULT '',
+            activity_type           TEXT,
+            activity_sub_type       TEXT,
+            end_timestamp_local     TEXT,
+            duration_seconds        REAL,
+            device_id               TEXT,
+            raw_json                TEXT,
+            PRIMARY KEY (calendar_date, start_timestamp_local)
+        );
+        INSERT OR REPLACE INTO daily_events
+            (calendar_date, start_timestamp_local, activity_type, activity_sub_type,
+             end_timestamp_local, duration_seconds, device_id, raw_json)
+        SELECT calendar_date,
+               COALESCE(start_timestamp_local, json_extract(raw_json, '$.startTimestampGMT'), ''),
+               activity_type, activity_sub_type, end_timestamp_local,
+               duration_seconds, device_id, raw_json
+        FROM daily_events_old;
+        DROP TABLE daily_events_old;
+        """
+    )
+    # Older rows kept the whole day's event list in a single row's raw_json.
+    lists = conn.execute(
+        "SELECT calendar_date, raw_json FROM daily_events "
+        "WHERE json_valid(raw_json) AND json_type(raw_json) = 'array'"
+    ).fetchall()
+    for cal_date, raw in lists:
+        try:
+            events = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        conn.execute("DELETE FROM daily_events WHERE calendar_date = ? AND raw_json = ?", (cal_date, raw))
+        upsert_daily_events(conn, events, cal_date=cal_date)
+
+
 def migrate_training_status_table(conn: sqlite3.Connection) -> None:
     """Migrate the training_status table to include acute and chronic load columns."""
     cursor = conn.execute("PRAGMA table_info(training_status)")
@@ -1402,6 +1522,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     migrate_fitness_age_table(conn)
     migrate_weight_table_v3(conn)
     migrate_activity_table(conn)
+    migrate_health_status_table(conn)
+    migrate_daily_events_table(conn)
 
     # Only run cleanup/backfill when there are rows that actually need it.
     needs_cleanup = conn.execute(
@@ -3060,35 +3182,94 @@ def upsert_training_status(conn, record, cal_date=None):
     )
 
 
+def _scalar_or_none(v):
+    """Values land in a REAL column; anything structural stays in raw_json."""
+    return v if isinstance(v, (int, float, str)) and not isinstance(v, bool) else None
+
+
 def upsert_health_status(conn, record, cal_date=None):
-    d = cal_date or record.get("calendarDate") or record.get("date")
-    if d:
-        conn.execute(
-            "INSERT OR REPLACE INTO health_status (calendar_date, overall_status, raw_json) VALUES (?, ?, ?)",
-            (d, record.get("overallStatus"), json.dumps(record)),
-        )
+    """Store one row per (day, metric).
 
-
-def upsert_daily_events(conn, record, cal_date=None):
+    Two record shapes reach here. The sync passes each metric on its own —
+    ``{"type": "SKIN_TEMP_F", "status": "IN_RANGE", "value": -0.5}`` — because
+    the GraphQL unwrapper flattens ``{"metrics": [...]}`` into a list. Callers
+    that skip that unwrapping (the ``health_status`` route without the ``gql_``
+    prefix, and stored rows being migrated) pass the wrapper itself, so both are
+    accepted. Keyed on the day alone all six of a day's metrics wrote the same
+    row and only the last one listed survived.
+    """
+    if not isinstance(record, dict):
+        return
     d = cal_date or record.get("calendarDate") or record.get("date")
     if not d:
         return
-    # record may be a list of event objects; use the first non-rest event for scalars
-    events = record if isinstance(record, list) else [record]
-    primary = next((e for e in events if e.get("activityType")), events[0] if events else {})
+
+    metrics = record.get("metrics")
+    if isinstance(metrics, list):
+        overall = record.get("overallStatus")
+        for metric in metrics:
+            if isinstance(metric, dict):
+                upsert_health_status(conn, {"overallStatus": overall, **metric}, cal_date=d)
+        if not metrics:
+            # A day whose summary carries no metric list still says something
+            # (an overall status, or simply that the day was fetched).
+            _write_health_status_row(conn, d, record)
+        return
+
+    _write_health_status_row(conn, d, record)
+
+
+def _write_health_status_row(conn, d, record):
+    conn.execute(
+        """INSERT OR REPLACE INTO health_status
+           (calendar_date, metric_type, status, value, overall_status, raw_json)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            d,
+            record.get("type") or "",
+            record.get("status"),
+            _scalar_or_none(record.get("value")),
+            record.get("overallStatus"),
+            json.dumps(record),
+        ),
+    )
+
+
+def upsert_daily_events(conn, record, cal_date=None):
+    """Store every event of the day, one row each.
+
+    A day holds several events — a walk, a ride, a stress spike. This used to
+    keep one: a list argument was reduced to its first typed event, and the sync
+    (which passes events one at a time) had each overwrite the previous, so only
+    the last one listed survived. The start time separates them, and is part of
+    the key.
+    """
+    if isinstance(record, list):
+        for event in record:
+            upsert_daily_events(conn, event, cal_date=cal_date)
+        return
+    if not isinstance(record, dict):
+        return
+    d = cal_date or record.get("calendarDate") or record.get("date")
+    if not d:
+        return
+    # Events without a local start still have to land somewhere; the GMT start
+    # is the next best separator, and "" the last resort (such events are
+    # indistinguishable, so one row is all they can occupy).
+    start = record.get("startTimestampLocal") or record.get("startTimestampGMT") or ""
     conn.execute(
         """INSERT OR REPLACE INTO daily_events
-           (calendar_date, activity_type, activity_sub_type,
-            start_timestamp_local, end_timestamp_local, duration_seconds, device_id, raw_json)
+           (calendar_date, start_timestamp_local, activity_type, activity_sub_type,
+            end_timestamp_local, duration_seconds, device_id, raw_json)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             d,
-            primary.get("activityType"),
-            primary.get("activitySubType"),
-            primary.get("startTimestampLocal"),
-            primary.get("endTimestampLocal"),
-            primary.get("duration"),
-            primary.get("deviceId"),
+            start,
+            record.get("activityType"),
+            record.get("activitySubType"),
+            record.get("endTimestampLocal"),
+            record.get("duration"),
+            record.get("deviceId"),
             json.dumps(record),
         ),
     )

@@ -2827,7 +2827,7 @@ def garmin_daily_events(days: int = 7) -> str:
                       duration_seconds, device_id, raw_json
                FROM daily_events
                WHERE calendar_date >= ?
-               ORDER BY calendar_date DESC""",
+               ORDER BY calendar_date DESC, start_timestamp_local DESC""",
             [start],
         )
 
