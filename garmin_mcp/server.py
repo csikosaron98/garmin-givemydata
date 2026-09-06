@@ -775,7 +775,9 @@ def garmin_today() -> str:
                       hrv_factor_percent, hrv_factor_feedback, hrv_weekly_average,
                       sleep_history_factor_percent, sleep_history_factor_feedback,
                       stress_history_factor_percent, stress_history_factor_feedback,
-                      acwr_factor_percent, acwr_factor_feedback
+                      acwr_factor_percent, acwr_factor_feedback,
+                      json_extract(raw_json, '$.timestamp') AS timestamp,
+                      json_extract(raw_json, '$.timestampLocal') AS timestamp_local
                FROM training_readiness WHERE calendar_date = ?""",
             [today],
         )
