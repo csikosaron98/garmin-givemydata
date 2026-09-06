@@ -2106,6 +2106,18 @@ def upsert_activity(conn: sqlite3.Connection, record: dict) -> None:
     )
 
 
+def _readiness_snapshot_ts(record) -> str:
+    """Sort key for readiness snapshots: the moment Garmin computed one.
+
+    ISO-8601 timestamps sort correctly as strings, so no parsing is needed —
+    and a missing timestamp yields "", which sorts first and therefore loses.
+    """
+    if not isinstance(record, dict):
+        return ""
+    ts = record.get("timestamp")
+    return "" if ts is None else str(ts)
+
+
 def upsert_training_readiness(conn: sqlite3.Connection, record: dict) -> None:
     conn.execute(
         """
@@ -3711,7 +3723,19 @@ def save_to_db(conn: sqlite3.Connection, endpoint_name: str, data, cal_date: str
                 count += 1
 
         elif name == "training_readiness":
-            for rec in records:
+            # Garmin computes readiness several times a day — one observed sync
+            # brought back five snapshots for a two-day window. calendar_date is
+            # this table's primary key, so only one of them survives, and
+            # INSERT OR REPLACE means it is whichever the API happened to list
+            # last. In practice that was the wake-up snapshot, which is why a
+            # dashboard reading this table showed a score from 00:53 at 09:04
+            # and disagreed with the watch.
+            #
+            # Order by the snapshot's own timestamp so the newest wins instead
+            # of the luckiest. Records with no timestamp sort first, so a dated
+            # snapshot always beats an undated one rather than depending on
+            # arrival order.
+            for rec in sorted(records, key=_readiness_snapshot_ts):
                 upsert_training_readiness(conn, rec)
                 count += 1
 
