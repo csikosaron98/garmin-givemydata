@@ -3104,6 +3104,24 @@ def upsert_earned_badges(conn: sqlite3.Connection, record: dict) -> None:
     )
 
 
+# Enough of a record to identify which key a handler was looking for, without
+# putting the values — which are personal data — into the log.
+_SHAPE_KEY_LIMIT = 15
+
+
+def _describe_shape(record) -> str:
+    """Name a record's top-level keys, for a log line about why it was dropped."""
+    if not isinstance(record, dict):
+        return f"not a dict ({type(record).__name__})"
+    keys = sorted(record)
+    if not keys:
+        return "empty dict"
+    shown = ", ".join(keys[:_SHAPE_KEY_LIMIT])
+    if len(keys) > _SHAPE_KEY_LIMIT:
+        shown += f", … ({len(keys)} keys total)"
+    return "keys: " + shown
+
+
 def _persisted(conn: sqlite3.Connection, call) -> int:
     """1 if the call actually wrote to the database, 0 if it stored nothing.
 
@@ -4116,11 +4134,14 @@ def save_to_db(conn: sqlite3.Connection, endpoint_name: str, data, cal_date: str
     # Records arrived and none of them stuck: the signature of a handler
     # silently dropping a shape it does not recognise. Worth a warning rather
     # than another clean-looking sync — this is the symptom the old counter hid.
+    # The keys are named because "unrecognised shape" on its own sends you back
+    # to the server to find out which one: with goals it was userGoalType where
+    # the handler looked for goalType, and one line of log would have said so.
     if records and not count:
         log.warning(
             "save_to_db: '%s' received %d record(s) but stored none — a handler "
-            "dropped them, most likely an unrecognised payload shape",
-            endpoint_name, len(records),
+            "dropped them. First record: %s",
+            endpoint_name, len(records), _describe_shape(records[0]),
         )
 
     return count

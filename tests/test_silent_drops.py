@@ -185,3 +185,38 @@ def test_both_live_goals_survive_a_resync(temp_db):
     assert [(r["goal_type"], r["goal_value"]) for r in rows] == [
         ("STEPS", 14570), ("WEIGHT_GRAMS", 75000)
     ], "three syncs leave exactly the two current goals"
+
+
+# ---- the warning has to be actionable ------------------------------------
+
+def test_the_warning_names_the_keys_it_did_not_recognise(temp_db, caplog):
+    """"Unrecognised shape" alone sends you back to the server to find out which.
+
+    With goals the handler looked for goalType while Garmin sends userGoalType;
+    one log line naming the keys would have answered it without a deploy.
+    """
+    with caplog.at_level(logging.WARNING):
+        save_to_db(temp_db, "sleep_stats", [{"avgSleepSeconds": 25000, "wtf": 1}])
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "avgSleepSeconds" in msg and "wtf" in msg, "the keys must be in the log"
+
+
+def test_the_warning_does_not_log_the_values(temp_db, caplog):
+    """Keys identify the shape; values are personal data and stay out of logs."""
+    with caplog.at_level(logging.WARNING):
+        save_to_db(temp_db, "sleep_stats", [{"restingHeartRate": 39, "weight": 74130}])
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "restingHeartRate" in msg
+    assert "39" not in msg and "74130" not in msg
+
+
+def test_a_long_record_is_summarised_not_dumped(temp_db):
+    from garmin_mcp.db import _describe_shape
+    out = _describe_shape({f"key{i:02d}": i for i in range(40)})
+    assert "40 keys total" in out
+    assert out.count(",") <= 15, "a 40-key record must not print all 40"
+
+
+def test_a_non_dict_record_says_so(temp_db):
+    from garmin_mcp.db import _describe_shape
+    assert "not a dict" in _describe_shape(["a", "list"])
