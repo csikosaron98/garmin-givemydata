@@ -3110,16 +3110,22 @@ _SHAPE_KEY_LIMIT = 15
 
 
 def _describe_shape(record) -> str:
-    """Name a record's top-level keys, for a log line about why it was dropped."""
+    """A record's top-level keys as one unbroken token, for a log line.
+
+    Comma-separated with no spaces on purpose. The service runs under a log
+    handler that wraps long prose across several lines with indentation, which
+    makes a message impossible to grep — the endpoint name ends up on a
+    different line from its keys. Everything here stays greppable as one field.
+    """
     if not isinstance(record, dict):
-        return f"not a dict ({type(record).__name__})"
+        return f"keys=<not-a-dict:{type(record).__name__}>"
     keys = sorted(record)
     if not keys:
-        return "empty dict"
-    shown = ", ".join(keys[:_SHAPE_KEY_LIMIT])
+        return "keys=<empty>"
+    shown = ",".join(keys[:_SHAPE_KEY_LIMIT])
     if len(keys) > _SHAPE_KEY_LIMIT:
-        shown += f", … ({len(keys)} keys total)"
-    return "keys: " + shown
+        shown += f",...+{len(keys) - _SHAPE_KEY_LIMIT}more"
+    return "keys=" + shown
 
 
 def _persisted(conn: sqlite3.Connection, call) -> int:
@@ -4138,9 +4144,9 @@ def save_to_db(conn: sqlite3.Connection, endpoint_name: str, data, cal_date: str
     # to the server to find out which one: with goals it was userGoalType where
     # the handler looked for goalType, and one line of log would have said so.
     if records and not count:
+        # One short line, no prose: see _describe_shape for why.
         log.warning(
-            "save_to_db: '%s' received %d record(s) but stored none — a handler "
-            "dropped them. First record: %s",
+            "save_to_db drop endpoint=%s records=%d %s",
             endpoint_name, len(records), _describe_shape(records[0]),
         )
 

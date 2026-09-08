@@ -143,14 +143,14 @@ def test_storing_nothing_is_reported_as_a_warning(temp_db, caplog):
     with caplog.at_level(logging.WARNING):
         n = save_to_db(temp_db, "sleep_stats", [{"no": "usable key"}])
     assert n == 0
-    assert any("stored none" in r.getMessage() for r in caplog.records), "a total drop must warn"
+    assert any("save_to_db drop" in r.getMessage() for r in caplog.records), "a total drop must warn"
     assert any("sleep_stats" in r.getMessage() for r in caplog.records), "and must name the endpoint"
 
 
 def test_a_successful_save_does_not_warn(temp_db, caplog):
     with caplog.at_level(logging.WARNING):
         save_to_db(temp_db, "sleep_stats", [{"calendarDate": "2026-09-07"}])
-    assert not [r for r in caplog.records if "stored none" in r.getMessage()]
+    assert not [r for r in caplog.records if "save_to_db drop" in r.getMessage()]
 
 
 # ---- the real payload ----------------------------------------------------
@@ -213,10 +213,23 @@ def test_the_warning_does_not_log_the_values(temp_db, caplog):
 def test_a_long_record_is_summarised_not_dumped(temp_db):
     from garmin_mcp.db import _describe_shape
     out = _describe_shape({f"key{i:02d}": i for i in range(40)})
-    assert "40 keys total" in out
+    assert "+25more" in out
     assert out.count(",") <= 15, "a 40-key record must not print all 40"
 
 
 def test_a_non_dict_record_says_so(temp_db):
     from garmin_mcp.db import _describe_shape
-    assert "not a dict" in _describe_shape(["a", "list"])
+    assert "not-a-dict" in _describe_shape(["a", "list"])
+
+
+def test_the_warning_is_one_greppable_line(temp_db, caplog):
+    """The service's log handler wraps long prose across indented lines, which
+    put the endpoint name and its keys on different lines and made the message
+    impossible to grep. It has to survive as one field-shaped line."""
+    with caplog.at_level(logging.WARNING):
+        save_to_db(temp_db, "sleep_stats", [{"avgSleepSeconds": 1, "zzz": 2}])
+    msg = next(r.getMessage() for r in caplog.records if "save_to_db drop" in r.getMessage())
+    assert "\n" not in msg, "a multi-line warning cannot be grepped"
+    assert "endpoint=sleep_stats" in msg
+    assert "keys=avgSleepSeconds,zzz" in msg, "keys are one unbroken token"
+    assert " " not in msg.split("keys=")[1], "no spaces inside the key list"
