@@ -1,6 +1,8 @@
 """Regression tests for garmin_client.client."""
 
 import inspect
+from unittest import mock
+import os
 import tempfile
 import threading
 import unittest
@@ -9,7 +11,7 @@ from unittest.mock import patch
 
 from selenium.common.exceptions import TimeoutException
 
-from garmin_client.client import GarminClient, _ProcessLifecycle
+from garmin_client.client import GarminClient, _ProcessLifecycle, _chromium_binary
 
 
 class TestProcessLifecycleThreadSafety(unittest.TestCase):
@@ -144,3 +146,43 @@ class TestMfaRaceCondition(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestChromiumDetection(unittest.TestCase):
+    """The VM needs Selenium pointed at its snap-installed Chromium.
+
+    That setting lived on the server as an uncommitted edit, present in no git
+    history — one `git checkout` from silently breaking Garmin login the next
+    time the session needed re-authenticating. It is detected here instead, so
+    the same checkout runs on the VM and on a laptop.
+    """
+
+    def test_an_explicit_override_wins(self):
+        with mock.patch.dict(os.environ, {"CHROMIUM_BINARY": "/opt/my/chrome"}):
+            self.assertEqual(_chromium_binary(), "/opt/my/chrome")
+
+    def test_the_snap_path_is_used_when_it_exists(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("garmin_client.client._os.path.exists", lambda p: p == "/snap/bin/chromium"):
+            self.assertEqual(_chromium_binary(), "/snap/bin/chromium")
+
+    def test_nothing_is_forced_on_an_ordinary_machine(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("garmin_client.client._os.path.exists", lambda p: False):
+            self.assertIsNone(
+                _chromium_binary(),
+                "forcing a binary_location on a machine with a normal Chrome "
+                "install breaks the driver instead of helping it",
+            )
+
+    def test_the_driver_setup_sets_binary_location_only_when_one_was_found(self):
+        # The driver kwargs are built in _launch_browser(), which login() calls.
+        source = inspect.getsource(GarminClient._launch_browser)
+        self.assertIn("chromium = _chromium_binary()", source)
+        self.assertIn('driver_kwargs["binary_location"] = chromium', source)
+        self.assertNotIn(
+            'binary_location="/snap/bin/chromium"',
+            source,
+            "Regression: the snap path is hard-coded again, which breaks every "
+            "machine that is not the Oracle VM.",
+        )

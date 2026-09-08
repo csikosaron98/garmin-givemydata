@@ -103,6 +103,27 @@ class _ProcessLifecycle:
 # ─── Garmin Client ───────────────────────────────────────────────
 
 
+# Browsers SeleniumBase does not find on its own. The snap path is the Oracle
+# VM's; add to the tuple rather than branching on hostname.
+_UNDISCOVERABLE_BROWSERS = ("/snap/bin/chromium",)
+
+
+def _chromium_binary():
+    """Path to a browser SeleniumBase needs to be pointed at, or None.
+
+    None means "leave the default detection alone", which is the right answer
+    on any machine with an ordinary Chrome install. CHROMIUM_BINARY overrides
+    everything, for a browser in a place this does not know about.
+    """
+    override = _os.environ.get("CHROMIUM_BINARY")
+    if override:
+        return override
+    for path in _UNDISCOVERABLE_BROWSERS:
+        if _os.path.exists(path):
+            return path
+    return None
+
+
 class GarminClient:
     def __init__(
         self,
@@ -319,6 +340,17 @@ class GarminClient:
         )
         if use_headless2:
             driver_kwargs["headless2"] = True
+        # Only set when the browser is somewhere SeleniumBase will not look.
+        # Detected rather than hard-coded: the Oracle VM installs Chromium as a
+        # snap, a Mac has it elsewhere or not at all, and forcing the snap path
+        # on a machine without it breaks login outright. This lived on the
+        # server for months as an uncommitted edit in no git history anywhere.
+        chromium = _chromium_binary()
+        if chromium:
+            driver_kwargs["binary_location"] = chromium
+            # Reuse the chromedriver already sitting beside that browser instead
+            # of downloading a fresh one on every login.
+            driver_kwargs["driver_version"] = "keep"
 
         try:
             self._driver = Driver(**driver_kwargs)
