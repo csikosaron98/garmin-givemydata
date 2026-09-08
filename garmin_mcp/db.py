@@ -3104,6 +3104,20 @@ def upsert_earned_badges(conn: sqlite3.Connection, record: dict) -> None:
     )
 
 
+def _persisted(conn: sqlite3.Connection, call) -> int:
+    """1 if the call actually wrote to the database, 0 if it stored nothing.
+
+    Handlers report nothing about what they did — several return early when a
+    record carries no usable key — so this measures instead of trusting. It
+    counts the RECORD, not the statements: upsert_heart_rate does an
+    INSERT OR IGNORE followed by an UPDATE against the same row, which is two
+    changes and one record.
+    """
+    before = conn.total_changes
+    call()
+    return 1 if conn.total_changes > before else 0
+
+
 def _upsert_raw_only(conn: sqlite3.Connection, table: str, key_col: str, record: dict, key_val: str) -> None:
     """Helper for tables that only have a key + raw_json."""
     conn.execute(
@@ -3284,8 +3298,17 @@ def upsert_activity_trends(conn, record, activity_type="all", cal_date=None):
         )
 
 
-def upsert_sleep_stats(conn, record):
-    d = record.get("calendarDate") or record.get("date")
+def upsert_sleep_stats(conn, record, cal_date=None):
+    """Store one sleep-stats record.
+
+    The endpoint is a RANGE query (/stats/sleep/daily/{start}/{end}), and what
+    comes back does not necessarily carry a per-record date — which is why this
+    used to store nothing at all while the sync counted a record every 15
+    minutes. The record's own date wins when it has one (a range can cover more
+    than the day we asked about); otherwise the requested date is the honest
+    key, the same fallback upsert_daily_movement already uses.
+    """
+    d = record.get("calendarDate") or record.get("date") or cal_date
     if d:
         _upsert_raw_only(conn, "sleep_stats", "calendar_date", record, d)
 
@@ -3405,14 +3428,49 @@ def upsert_gear(conn, record):
     )
 
 
+# Identity keys Garmin uses across its goal-shaped payloads. The userGoalsScalar
+# response has never been captured here, so this list is a best effort — which is
+# exactly why replace_goals() below does NOT depend on it: a record with no
+# recognised id is still stored, under an auto-assigned rowid.
+_GOAL_ID_KEYS = ("id", "goalId", "userGoalPk", "goalPk", "pk")
+
+
+def _goal_id(record):
+    for k in _GOAL_ID_KEYS:
+        v = record.get(k)
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.isdigit():
+            return int(v)
+    return None
+
+
 def upsert_goals(conn, record):
-    g_id = record.get("id") or record.get("goalId")
-    if not g_id:
-        return
+    """Store one goal, with or without an id of its own.
+
+    This used to `return` when no id was found, so every record was dropped
+    while the caller counted it as saved — the goals table sat empty through
+    thousands of "successful" syncs. goal_id is INTEGER PRIMARY KEY, so passing
+    NULL lets SQLite assign a rowid and the record is kept either way.
+    """
     conn.execute(
         "INSERT OR REPLACE INTO goals (goal_id, goal_type, goal_value, raw_json) VALUES (?, ?, ?, ?)",
-        (g_id, record.get("goalType"), record.get("goalValue"), json.dumps(record)),
+        (_goal_id(record), record.get("goalType"), record.get("goalValue"), json.dumps(record)),
     )
+
+
+def replace_goals(conn, records):
+    """Replace the whole goal set.
+
+    Goals are current state, not history: the table has no date column and the
+    endpoint returns "the goals you have now". Without a reliable id, upserting
+    row by row would append a new row on every sync whose payload differed even
+    slightly. Clearing first makes a re-sync idempotent regardless of what the
+    identity field turns out to be called.
+    """
+    conn.execute("DELETE FROM goals")
+    for rec in records:
+        upsert_goals(conn, rec)
 
 
 def upsert_activity_types(conn, record):
@@ -3707,181 +3765,153 @@ def save_to_db(conn: sqlite3.Connection, endpoint_name: str, data, cal_date: str
     if not records:
         return 0
 
+    # Records that actually reached the database, measured rather than assumed.
+    # Every branch below used to add one per record it walked past, which is not
+    # the same thing: a handler that finds no usable key returns without
+    # inserting and the count still went up. That is how `goals` and
+    # `sleep_stats` reported a record saved every 15 minutes for months while
+    # their tables stayed completely empty.
     count = 0
 
     try:
         if name == "daily_summary":
             for rec in records:
-                upsert_daily_summary(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_daily_summary(conn, rec))
 
         elif name == "sleep":
             for rec in records:
-                upsert_sleep(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_sleep(conn, rec))
 
         elif name == "heart_rate" or name == "heart_rate_detail":
             for rec in records:
-                upsert_heart_rate(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_heart_rate(conn, rec, cal_date))
 
         elif name == "stress":
             for rec in records:
-                upsert_stress(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_stress(conn, rec, cal_date))
 
         elif name == "spo2":
             for rec in records:
-                upsert_spo2(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_spo2(conn, rec, cal_date))
 
         elif name == "respiration":
             for rec in records:
-                upsert_respiration(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_respiration(conn, rec, cal_date))
 
         elif name in ("body_battery_events", "body_battery_stress"):
             for rec in records:
-                upsert_body_battery(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_body_battery(conn, rec, cal_date))
 
         elif name == "steps":
             for rec in records:
-                upsert_steps(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_steps(conn, rec, cal_date))
 
         elif name == "floors":
             for rec in records:
-                upsert_floors(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_floors(conn, rec, cal_date))
 
         elif name == "intensity_minutes" or name == "intensity_minutes_weekly":
             for rec in records:
-                upsert_intensity_minutes(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_intensity_minutes(conn, rec, cal_date))
 
         elif name == "hydration":
             for rec in records:
-                upsert_hydration(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_hydration(conn, rec, cal_date))
 
         elif name == "fitness_age":
             for rec in records:
-                upsert_fitness_age(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_fitness_age(conn, rec, cal_date))
 
         elif name == "daily_movement":
             for rec in records:
-                upsert_daily_movement(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_daily_movement(conn, rec, cal_date))
 
         elif name == "wellness_activity":
             for rec in records:
-                upsert_wellness_activity(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_wellness_activity(conn, rec, cal_date))
 
         elif name in ("training_status_daily", "training_status_weekly", "training_status"):
             for rec in records:
-                upsert_training_status(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_training_status(conn, rec, cal_date))
 
         elif name == "health_status" or name == "health_status_summary":
             # GraphQL healthStatusSummary returns a dict, not wrapped in a list
             if isinstance(data, dict) and "calendarDate" in data:
-                upsert_health_status(conn, data, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_health_status(conn, data, cal_date))
             else:
                 for rec in records:
-                    upsert_health_status(conn, rec, cal_date)
-                    count += 1
+                    count += _persisted(conn, lambda: upsert_health_status(conn, rec, cal_date))
 
         elif name == "daily_events":
             for rec in records:
-                upsert_daily_events(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_daily_events(conn, rec, cal_date))
 
         elif name.startswith("activity_trends"):
             # Extract activity type from name: activity_trends_running → running
             parts = name.split("_", 2)
             at = parts[2] if len(parts) > 2 else "all"
             for rec in records:
-                upsert_activity_trends(conn, rec, at, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_activity_trends(conn, rec, at, cal_date))
 
         elif name.startswith("activity_stats"):
             parts = name.split("_", 2)
             at = parts[2] if len(parts) > 2 else "all"
             for rec in records:
-                upsert_activity_trends(conn, rec, at, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_activity_trends(conn, rec, at, cal_date))
 
         elif name == "activities" or name == "activities_range":
             for rec in _extract_activity_records(data):
-                upsert_activity(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_activity(conn, rec))
 
         elif name in ("weight_range", "weight_latest", "weight", "weight_range_rest", "weight_first", "goal_weight"):
             for rec in _extract_weight_records(data):
-                upsert_weight(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_weight(conn, rec, cal_date))
 
         elif name in ("vo2max_trend", "vo2max_running"):
             for rec in records:
-                upsert_vo2max(conn, rec, "RUNNING")
-                count += 1
+                count += _persisted(conn, lambda: upsert_vo2max(conn, rec, "RUNNING"))
 
         elif name == "vo2max_cycling":
             for rec in records:
-                upsert_vo2max(conn, rec, "CYCLING")
-                count += 1
+                count += _persisted(conn, lambda: upsert_vo2max(conn, rec, "CYCLING"))
 
         elif name == "lactate_threshold":
             for rec in records:
-                upsert_lactate_threshold(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_lactate_threshold(conn, rec))
 
         elif name in ("blood_pressure", "blood_pressure_rest"):
             for rec in records:
-                upsert_blood_pressure(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_blood_pressure(conn, rec))
 
         elif name == "nutrition":
             for rec in _extract_nutrition_daily(data, cal_date):
-                upsert_nutrition_daily(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_nutrition_daily(conn, rec))
             for rec in _extract_nutrition_food_log(data, cal_date):
-                upsert_nutrition_food_log(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_nutrition_food_log(conn, rec))
 
         elif name in ("calories", "nutrition_meals"):
             for rec in _extract_calories_records(data, cal_date):
-                upsert_calories(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_calories(conn, rec))
 
         elif name == "sleep_stats":
             for rec in records:
-                upsert_sleep_stats(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_sleep_stats(conn, rec, cal_date))
 
         elif name == "sleep_detail" or name == "sleep_summaries":
             for rec in records:
-                upsert_sleep(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_sleep(conn, rec))
 
         elif name == "health_snapshot":
             for rec in records:
-                upsert_health_snapshot(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_health_snapshot(conn, rec))
 
         elif name == "workout_schedule":
             for rec in records:
-                upsert_workout_schedule(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_workout_schedule(conn, rec))
 
         elif name == "workouts":
             for rec in records:
-                upsert_workout(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_workout(conn, rec))
 
         elif name in ("hrv", "hrv_daily"):
             # HRV data may be nested: {hrvSummaries: [...]}
@@ -3900,8 +3930,7 @@ def save_to_db(conn: sqlite3.Connection, endpoint_name: str, data, cal_date: str
                     continue
                 if not rec.get("calendarDate") and not rec.get("startTimestampLocal"):
                     continue
-                upsert_hrv(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_hrv(conn, rec))
 
         elif name == "training_readiness":
             # Garmin computes readiness several times a day — one observed sync
@@ -3917,62 +3946,51 @@ def save_to_db(conn: sqlite3.Connection, endpoint_name: str, data, cal_date: str
             # snapshot always beats an undated one rather than depending on
             # arrival order.
             for rec in sorted(records, key=_readiness_snapshot_ts):
-                upsert_training_readiness(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_training_readiness(conn, rec))
 
         elif name == "personal_records":
             conn.execute("DELETE FROM personal_record")
             for rec in records:
-                upsert_personal_record(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_personal_record(conn, rec))
 
         elif name in ("devices", "devices_historical", "last_used_device", "sensors"):
             for rec in records:
-                upsert_device(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_device(conn, rec))
 
         elif name == "activity_types":
             for rec in records:
-                upsert_activity_types(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_activity_types(conn, rec))
 
         elif name in ("gear_list", "gear_types"):
             for rec in records:
-                upsert_gear(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_gear(conn, rec))
 
         elif name == "goals" or name == "user_goals":
-            for rec in records:
-                upsert_goals(conn, rec)
-                count += 1
+            replace_goals(conn, records)
+            count += len(records)
 
         elif name in ("personal_info", "user_settings", "social_profile", "user_profile_base"):
-            upsert_user_profile(conn, name, data)
-            count += 1
+            count += _persisted(conn, lambda: upsert_user_profile(conn, name, data))
 
         elif name == "hr_zones":
             conn.execute("DELETE FROM hr_zones")
             for rec in records:
-                upsert_hr_zones(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_hr_zones(conn, rec))
 
         elif name == "training_plans":
             conn.execute("DELETE FROM training_plans")
             for rec in records:
-                upsert_training_plans(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_training_plans(conn, rec))
 
         elif name.startswith("challenges_"):
             ctype = name.split("_", 1)[1]  # adhoc, badge, expeditions
             for rec in records:
-                upsert_challenges(conn, rec, ctype)
-                count += 1
+                count += _persisted(conn, lambda: upsert_challenges(conn, rec, ctype))
 
         elif name in ("daily_summaries", "stats_daily"):
             # GraphQL daily summaries and REST stats_daily → merge into daily_summary
             for rec in records:
-                upsert_daily_summary(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_daily_summary(conn, rec))
 
         elif name in (
             "daily_summaries_avg",
@@ -3986,24 +4004,20 @@ def save_to_db(conn: sqlite3.Connection, endpoint_name: str, data, cal_date: str
 
         elif name == "endurance_score":
             for rec in records:
-                upsert_endurance_score(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_endurance_score(conn, rec, cal_date))
 
         elif name == "hill_score":
             for rec in records:
-                upsert_hill_score(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_hill_score(conn, rec, cal_date))
 
         elif name == "race_predictions":
             for rec in records:
-                upsert_race_predictions(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_race_predictions(conn, rec, cal_date))
 
         elif name == "earned_badges":
             conn.execute("DELETE FROM earned_badges")
             for rec in records:
-                upsert_earned_badges(conn, rec)
-                count += 1
+                count += _persisted(conn, lambda: upsert_earned_badges(conn, rec))
 
         elif name == "activity_splits":
             # cal_date holds the activity_id for per-activity endpoints
@@ -4020,14 +4034,12 @@ def save_to_db(conn: sqlite3.Connection, endpoint_name: str, data, cal_date: str
         elif name == "activity_hr_zones":
             aid = int(cal_date) if cal_date else None
             if aid:
-                upsert_activity_hr_zones(conn, aid, data)
-                count += 1
+                count += _persisted(conn, lambda: upsert_activity_hr_zones(conn, aid, data))
 
         elif name == "activity_weather":
             aid = int(cal_date) if cal_date else None
             if aid:
-                upsert_activity_weather(conn, aid, data)
-                count += 1
+                count += _persisted(conn, lambda: upsert_activity_weather(conn, aid, data))
 
         elif name == "activity_details":
             # Detail endpoint has a different structure (summaryDTO, activityTypeDTO)
@@ -4067,13 +4079,11 @@ def save_to_db(conn: sqlite3.Connection, endpoint_name: str, data, cal_date: str
                         ),
                     )
                     # Extract running dynamics if present
-                    upsert_running_dynamics(conn, aid, rec)
-                    count += 1
+                    count += _persisted(conn, lambda: upsert_running_dynamics(conn, aid, rec))
 
         elif name == "hrv_timeline":
             for rec in records:
-                upsert_hrv_timeline(conn, rec, cal_date)
-                count += 1
+                count += _persisted(conn, lambda: upsert_hrv_timeline(conn, rec, cal_date))
 
         elif name == "activity_exercise_sets":
             aid = int(cal_date) if cal_date else None
@@ -4088,6 +4098,16 @@ def save_to_db(conn: sqlite3.Connection, endpoint_name: str, data, cal_date: str
 
     if count > 0:
         conn.commit()
+
+    # Records arrived and none of them stuck: the signature of a handler
+    # silently dropping a shape it does not recognise. Worth a warning rather
+    # than another clean-looking sync — this is the symptom the old counter hid.
+    if records and not count:
+        log.warning(
+            "save_to_db: '%s' received %d record(s) but stored none — a handler "
+            "dropped them, most likely an unrecognised payload shape",
+            endpoint_name, len(records),
+        )
 
     return count
 
