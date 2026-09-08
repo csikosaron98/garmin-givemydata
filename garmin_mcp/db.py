@@ -3428,11 +3428,24 @@ def upsert_gear(conn, record):
     )
 
 
-# Identity keys Garmin uses across its goal-shaped payloads. The userGoalsScalar
-# response has never been captured here, so this list is a best effort — which is
-# exactly why replace_goals() below does NOT depend on it: a record with no
-# recognised id is still stored, under an auto-assigned rowid.
-_GOAL_ID_KEYS = ("id", "goalId", "userGoalPk", "goalPk", "pk")
+# Captured from the live userGoalsScalar response on 2026-09-08:
+#   {"userGoalPk": 3373610567, "userGoalType": "STEPS", "goalValue": 14570,
+#    "trackingPeriodType": "DAILY", "userGoalCategory": "MY_AUTO",
+#    "startDate": "2025-06-05", "endDate": null, "userProfilePk": 133921336}
+# So the id is userGoalPk and the type is userGoalType — NOT goalType, which is
+# why goal_type came back NULL on the first live sync. The other spellings stay
+# as fallbacks; replace_goals() still does not depend on any of them.
+_GOAL_ID_KEYS = ("userGoalPk", "id", "goalId", "goalPk", "pk")
+_GOAL_TYPE_KEYS = ("userGoalType", "goalType", "type")
+_GOAL_VALUE_KEYS = ("goalValue", "value")
+
+
+def _first(record, keys):
+    for k in keys:
+        v = record.get(k)
+        if v is not None:
+            return v
+    return None
 
 
 def _goal_id(record):
@@ -3455,7 +3468,8 @@ def upsert_goals(conn, record):
     """
     conn.execute(
         "INSERT OR REPLACE INTO goals (goal_id, goal_type, goal_value, raw_json) VALUES (?, ?, ?, ?)",
-        (_goal_id(record), record.get("goalType"), record.get("goalValue"), json.dumps(record)),
+        (_goal_id(record), _first(record, _GOAL_TYPE_KEYS),
+         _first(record, _GOAL_VALUE_KEYS), json.dumps(record)),
     )
 
 

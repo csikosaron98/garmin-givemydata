@@ -15,6 +15,7 @@ The counter now measures what reached the database instead of counting records
 it walked past, so this whole class of failure reports itself.
 """
 
+import json
 import logging
 import sqlite3
 
@@ -150,3 +151,37 @@ def test_a_successful_save_does_not_warn(temp_db, caplog):
     with caplog.at_level(logging.WARNING):
         save_to_db(temp_db, "sleep_stats", [{"calendarDate": "2026-09-07"}])
     assert not [r for r in caplog.records if "stored none" in r.getMessage()]
+
+
+# ---- the real payload ----------------------------------------------------
+
+# Captured from the live connector on 2026-09-08, after the fix above let the
+# first goals actually reach the database. Until then this shape had never been
+# seen, which is why goal_type was read from "goalType" and came back NULL.
+LIVE_GOAL = {
+    "activityTypePk": None, "createDate": "2025-06-05T11:54:04.0", "endDate": None,
+    "goalName": None, "goalValue": 14570, "rulePk": None, "startDate": "2025-06-05",
+    "trackingPeriodType": "DAILY", "updateDate": "2026-09-08T00:00:00.0",
+    "userGoalCategory": "MY_AUTO", "userGoalPk": 3373610567,
+    "userGoalType": "STEPS", "userProfilePk": 133921336,
+}
+
+
+def test_the_real_payload_populates_every_column(temp_db):
+    upsert_goals(temp_db, LIVE_GOAL)
+    row = temp_db.execute("SELECT * FROM goals").fetchone()
+    assert row["goal_id"] == 3373610567, "userGoalPk is the identity"
+    assert row["goal_type"] == "STEPS", "userGoalType, not goalType"
+    assert row["goal_value"] == 14570
+    assert json.loads(row["raw_json"])["userGoalCategory"] == "MY_AUTO"
+
+
+def test_both_live_goals_survive_a_resync(temp_db):
+    weight_goal = dict(LIVE_GOAL, userGoalPk=3387137041,
+                       userGoalType="WEIGHT_GRAMS", goalValue=75000)
+    for _ in range(3):
+        replace_goals(temp_db, [LIVE_GOAL, weight_goal])
+    rows = temp_db.execute("SELECT goal_type, goal_value FROM goals ORDER BY goal_id").fetchall()
+    assert [(r["goal_type"], r["goal_value"]) for r in rows] == [
+        ("STEPS", 14570), ("WEIGHT_GRAMS", 75000)
+    ], "three syncs leave exactly the two current goals"
