@@ -403,6 +403,7 @@ class Gap:
     have: float
     want: float
     over: bool = False        # True when the target is a ceiling, not a floor
+    unit: str = ""            # minutes, where the gap is not a count of sessions
 
 
 def gaps(summary: dict, target: WeeklyTarget) -> list[Gap]:
@@ -417,8 +418,9 @@ def gaps(summary: dict, target: WeeklyTarget) -> list[Gap]:
     if c["strength"] < target.strength:
         out.append(Gap("strength sessions", c["strength"], target.strength))
     if target.long_minutes and summary["longest_base_minutes"] < target.long_minutes:
-        out.append(Gap("a long aerobic session, in minutes",
-                       summary["longest_base_minutes"], target.long_minutes))
+        out.append(Gap("the longest aerobic session",
+                       summary["longest_base_minutes"], target.long_minutes,
+                       unit="min"))
     if summary["sessions"] < target.sessions:
         out.append(Gap("sessions in total", summary["sessions"], target.sessions))
     if target.max_hard is not None and c["aerobic_quality"] > target.max_hard:
@@ -466,7 +468,14 @@ def observations(summary: dict, goal: Goal | None, date: str) -> list[str]:
                        f"{g.want:.0f} — past that the interference costs more "
                        f"strength than the aerobic work is worth here.")
         else:
-            out.append(f"{g.what}: {g.have:.0f} of {g.want:.0f}.")
+            unit = f" {g.unit}" if g.unit else ""
+            out.append(f"{g.what}: {g.have:.0f} of {g.want:.0f}{unit}.")
+
+    # What the shape of the week says, which no target can express as a number.
+    # Imported from week.py rather than restated, so the page, the email and this
+    # cannot word the same finding three ways.
+    from .week import insights
+    out.extend(insights(summary))
 
     # Interference is reported against the gap THIS goal cares about, which is
     # wider for the strength-side goals than the general six hours.

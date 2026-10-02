@@ -38,6 +38,7 @@ from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
+from . import goals as _goals
 from . import week as _week
 from .db import DB_PATH, get_connection
 
@@ -313,7 +314,20 @@ def fmt_hm(hours: float | None) -> str:
     return f"{total // 60}:{total % 60:02d}"
 
 
-def render_text(day: dict, decision: dict, rhr_mean, sessions: list[dict], wk: dict | None = None) -> str:
+def week_advice(wk: dict, goal, date: str | None) -> list[str]:
+    """The week's advice, from the goal layer when a goal is set.
+
+    One function for both renderings: the plain-text and the HTML halves of the
+    email used to each call the advice themselves, which is one edit away from
+    the two saying different things about the same morning.
+    """
+    if goal is not None and date:
+        return _goals.observations(wk, goal, date)
+    return _week.observations(wk)
+
+
+def render_text(day: dict, decision: dict, rhr_mean, sessions: list[dict],
+                wk: dict | None = None, goal=None, date: str | None = None) -> str:
     headline, body = PRESCRIPTIONS[decision["level"]]
     lines = [f"TODAY — {headline}", "", body, ""]
     if decision["limiter"]:
@@ -340,7 +354,7 @@ def render_text(day: dict, decision: dict, rhr_mean, sessions: list[dict], wk: d
         lines.append(f"  aerobic base {c['aerobic_base']} · quality {c['aerobic_quality']}"
                      f" · strength {c['strength']} · mixed {c['mixed']}"
                      f" · restorative {c['restorative']}")
-        for note in _week.observations(wk):
+        for note in week_advice(wk, goal, date):
             lines.append(f"  - {note}")
         lines.append("")
 
@@ -367,7 +381,8 @@ def _row(label: str, value: str) -> str:
             f'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">{value}</td></tr>')
 
 
-def render_html(day: dict, decision: dict, rhr_mean, sessions: list[dict], date: str, wk: dict | None = None) -> str:
+def render_html(day: dict, decision: dict, rhr_mean, sessions: list[dict],
+                date: str, wk: dict | None = None, goal=None) -> str:
     """Table layout and inline styles only — mail clients strip <style> blocks
     and support neither flex nor grid. Palette matches the dashboard so the two
     read as one system.
@@ -416,7 +431,7 @@ def render_html(day: dict, decision: dict, rhr_mean, sessions: list[dict], date:
             for label, n in chips)
         notes = "".join(
             f'<div style="font-size:12.5px;color:#20241f;line-height:1.5;padding-top:7px;">'
-            f'&middot; {o}</div>' for o in _week.observations(wk))
+            f'&middot; {o}</div>' for o in week_advice(wk, goal, date))
         week_html = (
             '<tr><td style="padding:22px 28px 0;">'
             '<div style="font-size:11px;letter-spacing:.07em;text-transform:uppercase;'
@@ -532,11 +547,19 @@ def build(conn: sqlite3.Connection, date: str) -> tuple[str, str, str] | None:
     except Exception as exc:
         log.warning("could not summarise the week: %s", exc)
         wk = None
+    # The goal the week is judged against. None is a legitimate answer, and a
+    # failure here must cost the brief no more than the goal line: the rest of
+    # the email is about today, which does not depend on it.
+    try:
+        goal = _goals.driving_goal(conn, date)
+    except Exception as exc:
+        log.warning("could not read the goal: %s", exc)
+        goal = None
     pretty = _dt.date.fromisoformat(date).strftime("%A %-d %B")
     return (
         f"Training brief — {pretty}",
-        render_text(day, decision, rhr_mean, sessions, wk),
-        render_html(day, decision, rhr_mean, sessions, date, wk),
+        render_text(day, decision, rhr_mean, sessions, wk, goal, date),
+        render_html(day, decision, rhr_mean, sessions, date, wk, goal),
     )
 
 

@@ -304,3 +304,64 @@ def test_an_unknown_timezone_does_not_crash(monkeypatch):
     from garmin_mcp.brief import local_now
     monkeypatch.setenv("BRIEF_TZ", "Mars/Olympus_Mons")
     assert isinstance(local_now(), dt.datetime)
+
+
+# ---- the goal reaches the email ------------------------------------------
+
+def _add_activity(conn, day, time, sport, minutes, *, load=50, z1=0, z2=0, z4=0):
+    cur = conn.execute("SELECT COALESCE(MAX(activity_id), 5000) + 1 FROM activity")
+    aid = cur.fetchone()[0]
+    conn.execute("INSERT INTO activity (activity_id, activity_type, start_time_local, "
+                 "duration_seconds, distance_meters, training_load) VALUES (?,?,?,?,?,?)",
+                 (aid, sport, f"{day} {time}:00", minutes * 60, 0, load))
+    conn.execute("INSERT INTO activity_hr_zones (activity_id, zone1_seconds, "
+                 "zone2_seconds, zone3_seconds, zone4_seconds, zone5_seconds) "
+                 "VALUES (?,?,?,?,?,?)", (aid, z1, z2, 0, z4, 0))
+    conn.commit()
+
+
+def test_with_no_goal_the_brief_still_reads_the_week(db):
+    """A goal is optional. "Set a goal first" is a useless thing to receive at
+    six in the morning."""
+    _seed(db, "2026-10-02")
+    _add_activity(db, "2026-09-28", "11:00", "strength_training", 70, load=12)
+    subject, text, html = build(db, "2026-10-02")
+    assert "THIS WEEK" in text
+    assert "goal" not in text.lower().split("THIS WEEK")[0], \
+        "nothing should claim a goal that was not set"
+
+
+def test_the_goal_appears_in_both_halves_of_the_email(db):
+    """The plain-text and HTML halves each used to call the advice themselves,
+    which is one edit away from the two describing the same morning differently."""
+    from garmin_mcp.goals import Goal, add_goal
+
+    _seed(db, "2026-10-02")
+    add_goal(db, Goal(kind="standing", name="Down to 73 kg", standing="fat_loss"))
+    _add_activity(db, "2026-09-28", "11:00", "strength_training", 70, load=12)
+    subject, text, html = build(db, "2026-10-02")
+    for half, body in (("text", text), ("html", html)):
+        assert "Fat loss" in body, f"the goal is missing from the {half} half"
+        assert "Down to 73 kg" in body, f"the goal's name is missing from the {half} half"
+
+
+def test_a_race_puts_its_phase_in_the_brief(db):
+    from garmin_mcp.goals import Goal, add_goal
+
+    _seed(db, "2026-10-02")
+    add_goal(db, Goal(kind="race", name="Hyrox Budapest", discipline="hyrox",
+                      race_date="2026-12-19", target="62:00"))
+    _add_activity(db, "2026-09-28", "11:00", "strength_training", 70, load=12)
+    subject, text, html = build(db, "2026-10-02")
+    assert "Hyrox Budapest" in text and "Build phase" in text
+    assert "62:00" in text, "the target time is part of the goal"
+
+
+def test_a_broken_goal_table_costs_the_brief_nothing_but_the_goal(db):
+    """The rest of the email is about today, which does not depend on the goal."""
+    _seed(db, "2026-10-02")
+    db.execute("DROP TABLE training_goal")
+    db.commit()
+    built = build(db, "2026-10-02")
+    assert built is not None, "the brief must still go out"
+    assert "TODAY" in built[1]

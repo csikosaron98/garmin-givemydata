@@ -266,9 +266,11 @@ def test_a_long_session_is_measured_in_minutes_not_sessions(db):
     s = _week(db, ("2026-09-28", "09:00", "running", 40,
                    {"load": 70, "z1": 1200, "z2": 1200}))
     long_gap = [x for x in gaps(s, STANDING_TARGETS["maintenance"])
-                if "long aerobic" in x.what]
+                if "longest aerobic" in x.what]
     assert len(long_gap) == 1
     assert long_gap[0].want == 60 and long_gap[0].have == 40
+    assert long_gap[0].unit == "min", (
+        "without a unit this reads as a count of sessions, not a duration")
 
 
 # ---- the advice -----------------------------------------------------------
@@ -382,3 +384,26 @@ def test_the_cli_refuses_a_bad_goal_loudly(db, tmp_path):
     conn.close()
     with pytest.raises(SystemExit):     # argparse rejects the choice itself
         main(["--db", str(path), "goal", "get_swole"])
+
+
+def test_the_shape_of_the_week_still_gets_said_with_a_goal_set(db):
+    """"All of it was hard" is a judgement no target can carry as a number, and
+    it was only reachable through the goal-free reading before."""
+    standing(db, "maintenance")
+    s = _week(db, ("2026-09-28", "18:00", "hiit", 60, {"load": 200, "z4": 1800}))
+    out = " ".join(observations(s, driving_goal(db, "2026-10-02"), "2026-10-02"))
+    assert "Easy volume" in out
+
+
+def test_that_line_is_defined_in_one_place(db):
+    """Two modules wording the same finding differently is the drift the
+    week/goal split exists to avoid."""
+    from garmin_mcp.week import insights
+
+    s = _week(db, ("2026-09-28", "18:00", "hiit", 60, {"load": 200, "z4": 1800}))
+    shared = insights(s)
+    assert shared, "the fixture should trigger an insight"
+    goal_lines = observations(s, Goal(kind="standing", name="m", standing="maintenance"),
+                              "2026-10-02")
+    for line in shared:
+        assert line in goal_lines, f"the goal layer reworded: {line}"

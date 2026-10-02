@@ -188,10 +188,32 @@ def summarize(conn: sqlite3.Connection, date: str) -> dict:
 # the athlete, because which day a session lands on is usually settled on the
 # day. Each line has to be actionable on its own — "do more" is not advice.
 
-def observations(summary: dict, target_sessions: int = 6) -> list[str]:
-    """Plain statements about the week so far, strongest first."""
-    out: list[str] = []
+def insights(summary: dict) -> list[str]:
+    """What the SHAPE of the week says, independent of any goal.
+
+    Kept separate from observations() because the goal layer needs exactly these
+    lines and none of the others: a goal expresses "two base sessions short" as a
+    number, but "all of it was hard" is a judgement about the shape that no
+    target can carry. Defined once here so the page, the brief and the goal layer
+    cannot word the same finding three ways.
+    """
     c = summary["counts"]
+    out: list[str] = []
+    if c["aerobic_base"] == 0 and c["aerobic_quality"] > 0:
+        out.append("All of this week's aerobic work was hard. Easy volume is what "
+                   "most of the adaptation comes from.")
+    if c["strength"] and not (c["aerobic_base"] or c["aerobic_quality"]):
+        out.append("Strength only so far, no aerobic work.")
+    return out
+
+
+def observations(summary: dict, target_sessions: int = 6) -> list[str]:
+    """Plain statements about the week so far, strongest first.
+
+    This is the goal-free reading. With a goal set, goals.observations() says the
+    same things against that goal's own targets instead.
+    """
+    out: list[str] = []
 
     if not summary["has_long_base"]:
         longest = summary["longest_endurance_minutes"]
@@ -200,12 +222,7 @@ def observations(summary: dict, target_sessions: int = 6) -> list[str]:
             f"against the {LONG_MINUTES} min that counts as one."
             if longest else "No aerobic session yet this week.")
 
-    if c["aerobic_base"] == 0 and c["aerobic_quality"] > 0:
-        out.append("All of this week's aerobic work was hard. Easy volume is what "
-                   "most of the adaptation comes from.")
-
-    if c["strength"] and not (c["aerobic_base"] or c["aerobic_quality"]):
-        out.append("Strength only so far, no aerobic work.")
+    out.extend(insights(summary))
 
     for day in summary["interference"]:
         out.append(
