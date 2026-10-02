@@ -90,6 +90,13 @@ class WeeklyTarget:
     # about one hard aerobic session a week the interference starts to cost more
     # strength than the aerobic work is worth to that goal. None = no ceiling.
     max_hard: int | None = None
+    # The other ceiling, and only a taper or a race week sets one. Everywhere
+    # else `sessions` is a floor and going over it is fine — but a taper whose
+    # whole purpose is less work has to be able to say "that is more than this
+    # week was for", or it cannot tell a taper from any other week. A base week
+    # does not set it: nagging someone who trains most days for training is
+    # worse than silence.
+    max_sessions: int | None = None
     # The separation this goal cares about between resistance work and hard
     # endurance work. Six hours is where interference becomes measurable; past
     # eight it is minimal, so a strength goal asks for the wider gap.
@@ -126,10 +133,10 @@ RACE_TARGETS: dict[str, dict[str, WeeklyTarget]] = {
         PHASE_PEAK: WeeklyTarget(6, base=2, quality=2, strength=2, long_minutes=60,
                                  focus="Race pace and the stations under fatigue",
                                  source=_HYROX_SOURCE),
-        PHASE_TAPER: WeeklyTarget(4, base=2, quality=1, strength=1, long_minutes=45,
+        PHASE_TAPER: WeeklyTarget(4, max_sessions=4, base=2, quality=1, strength=1, long_minutes=45,
                                   focus="Volume down, intensity kept — sharpness is not lost in two weeks, freshness is gained",
                                   source=_HYROX_SOURCE),
-        PHASE_RACE: WeeklyTarget(3, base=1, quality=1, strength=1, long_minutes=0,
+        PHASE_RACE: WeeklyTarget(3, max_sessions=3, base=1, quality=1, strength=1, long_minutes=0,
                                  focus="Short and easy. Nothing this week makes you fitter; several things can make you slower",
                                  source=_HYROX_SOURCE),
     },
@@ -145,10 +152,10 @@ RACE_TARGETS: dict[str, dict[str, WeeklyTarget]] = {
         PHASE_PEAK: WeeklyTarget(6, base=3, quality=2, strength=1, long_minutes=120,
                                  focus="Race-pace work inside the long run",
                                  source="80/20 polarised distribution"),
-        PHASE_TAPER: WeeklyTarget(4, base=3, quality=1, strength=1, long_minutes=60,
+        PHASE_TAPER: WeeklyTarget(4, max_sessions=4, base=3, quality=1, strength=1, long_minutes=60,
                                   focus="Volume down about 40%, one short quality session kept",
                                   source="80/20 polarised distribution"),
-        PHASE_RACE: WeeklyTarget(3, base=2, quality=1, strength=0, long_minutes=0,
+        PHASE_RACE: WeeklyTarget(3, max_sessions=3, base=2, quality=1, strength=0, long_minutes=0,
                                  focus="Easy, short, and off your feet otherwise",
                                  source="80/20 polarised distribution"),
     },
@@ -164,10 +171,10 @@ RACE_TARGETS: dict[str, dict[str, WeeklyTarget]] = {
         PHASE_PEAK: WeeklyTarget(7, base=4, quality=2, strength=1, long_minutes=270,
                                  focus="The longest sessions of the whole build",
                                  source="Long-course triathlon periodisation"),
-        PHASE_TAPER: WeeklyTarget(5, base=3, quality=1, strength=1, long_minutes=90,
+        PHASE_TAPER: WeeklyTarget(5, max_sessions=5, base=3, quality=1, strength=1, long_minutes=90,
                                   focus="Three weeks of coming down, not one",
                                   source="Long-course triathlon periodisation"),
-        PHASE_RACE: WeeklyTarget(3, base=2, quality=1, strength=0, long_minutes=0,
+        PHASE_RACE: WeeklyTarget(3, max_sessions=3, base=2, quality=1, strength=0, long_minutes=0,
                                  focus="Openers only",
                                  source="Long-course triathlon periodisation"),
     },
@@ -181,10 +188,10 @@ RACE_TARGETS: dict[str, dict[str, WeeklyTarget]] = {
         PHASE_PEAK: WeeklyTarget(6, base=2, quality=2, strength=2, long_minutes=60,
                                  focus="Sharpening",
                                  source="General preparation, no discipline given"),
-        PHASE_TAPER: WeeklyTarget(4, base=2, quality=1, strength=1, long_minutes=45,
+        PHASE_TAPER: WeeklyTarget(4, max_sessions=4, base=2, quality=1, strength=1, long_minutes=45,
                                   focus="Volume down, intensity kept",
                                   source="General preparation, no discipline given"),
-        PHASE_RACE: WeeklyTarget(3, base=1, quality=1, strength=1, long_minutes=0,
+        PHASE_RACE: WeeklyTarget(3, max_sessions=3, base=1, quality=1, strength=1, long_minutes=0,
                                  focus="Short and easy",
                                  source="General preparation, no discipline given"),
     },
@@ -300,6 +307,34 @@ def retire_goal(conn: sqlite3.Connection, goal_id: int) -> bool:
     keeping, and the week it was run in still has to be explicable later."""
     cur = conn.execute("UPDATE training_goal SET active = 0 WHERE goal_id = ?",
                        (goal_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def update_goal(conn: sqlite3.Connection, goal_id: int, **fields) -> bool:
+    """Change a stored goal in place.
+
+    Retiring and re-adding would work, but it loses the id and the created date
+    for what is usually a correction — a target time settled after the race was
+    entered, or the format of it written down.
+    """
+    allowed = ("name", "target", "notes", "priority", "race_date", "discipline",
+               "standing")
+    bad = sorted(set(fields) - set(allowed))
+    if bad:
+        raise ValueError(f"cannot set {bad}; only {allowed}")
+    fields = {k: v for k, v in fields.items() if v is not None}
+    if not fields:
+        return False
+    if "race_date" in fields:
+        _dt.date.fromisoformat(fields["race_date"])
+    if "discipline" in fields and fields["discipline"] not in RACE_DISCIPLINES:
+        raise ValueError(f"discipline must be one of {RACE_DISCIPLINES}")
+    if "standing" in fields and fields["standing"] not in STANDING_KINDS:
+        raise ValueError(f"standing must be one of {STANDING_KINDS}")
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    cur = conn.execute(f"UPDATE training_goal SET {sets} WHERE goal_id = ?",
+                       (*fields.values(), goal_id))
     conn.commit()
     return cur.rowcount > 0
 
@@ -426,6 +461,9 @@ def gaps(summary: dict, target: WeeklyTarget) -> list[Gap]:
     if target.max_hard is not None and c["aerobic_quality"] > target.max_hard:
         out.append(Gap("hard aerobic sessions", c["aerobic_quality"],
                        target.max_hard, over=True))
+    if target.max_sessions is not None and summary["sessions"] > target.max_sessions:
+        out.append(Gap("sessions this week", summary["sessions"],
+                       target.max_sessions, over=True))
     return out
 
 
@@ -463,7 +501,11 @@ def observations(summary: dict, goal: Goal | None, date: str) -> list[str]:
         out.append(f"The week has met its goal: {summary['sessions']} sessions, "
                    f"{summary['total_minutes']} min.")
     for g in shortfalls:
-        if g.over:
+        if g.over and g.what == "sessions this week":
+            out.append(f"{g.what}: {g.have:.0f}, and this week asks for at most "
+                       f"{g.want:.0f}. Coming down is the point of it — nothing "
+                       "added now arrives in time to help.")
+        elif g.over:
             out.append(f"{g.what}: {g.have:.0f}, and this goal asks for at most "
                        f"{g.want:.0f} — past that the interference costs more "
                        f"strength than the aerobic work is worth here.")
@@ -547,6 +589,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--priority", type=int, default=2)
     p.add_argument("--notes", default=None)
 
+    p = sub.add_parser("set", help="change a stored goal in place")
+    p.add_argument("goal_id", type=int)
+    p.add_argument("--name", default=None)
+    p.add_argument("--target", default=None, help="e.g. 65:00, 72 kg")
+    p.add_argument("--notes", default=None)
+    p.add_argument("--priority", type=int, default=None)
+    p.add_argument("--race-date", dest="race_date", default=None)
+
     p = sub.add_parser("retire", help="deactivate a goal, keeping its history")
     p.add_argument("goal_id", type=int)
 
@@ -587,6 +637,20 @@ def main(argv: list[str] | None = None) -> int:
                                   standing=a.standing, target=a.target,
                                   priority=a.priority, notes=a.notes))
         print(f"Added goal [{gid}]: {STANDING_LABELS[a.standing]}")
+        return 0
+
+    if a.cmd == "set":
+        changed = update_goal(conn, a.goal_id, name=a.name, target=a.target,
+                              notes=a.notes, priority=a.priority,
+                              race_date=a.race_date)
+        if not changed:
+            print(f"Nothing changed — no goal {a.goal_id}, or nothing to set.")
+            return 0
+        for g in all_goals(conn, include_retired=True):
+            if g.goal_id == a.goal_id:
+                print("Updated:" + _fmt_goal(g, today))
+                if g.notes:
+                    print(f"    notes: {g.notes}")
         return 0
 
     if a.cmd == "retire":

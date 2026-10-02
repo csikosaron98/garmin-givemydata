@@ -407,3 +407,117 @@ def test_that_line_is_defined_in_one_place(db):
                               "2026-10-02")
     for line in shared:
         assert line in goal_lines, f"the goal layer reworded: {line}"
+
+
+# ---- the taper's ceiling --------------------------------------------------
+# Found on live data: a taper asking for 4 sessions said nothing about a week
+# with 6 in it. `sessions` was a floor everywhere, so the one week whose whole
+# purpose is less work could not tell itself apart from any other week.
+
+def test_every_taper_and_race_week_caps_the_session_count():
+    for discipline in RACE_DISCIPLINES:
+        for phase in (PHASE_TAPER, PHASE_RACE):
+            t = RACE_TARGETS[discipline][phase]
+            assert t.max_sessions == t.sessions, (
+                f"{discipline} {phase} does not cap its session count, so going "
+                "over it passes silently")
+
+
+def test_the_building_phases_do_not_cap_it():
+    """Nagging someone who trains most days for training is worse than silence."""
+    for discipline in RACE_DISCIPLINES:
+        for phase in (PHASE_BASE, PHASE_BUILD, PHASE_PEAK):
+            assert RACE_TARGETS[discipline][phase].max_sessions is None, \
+                f"{discipline} {phase} caps sessions, which is not what a build week is"
+    for kind in STANDING_KINDS:
+        assert STANDING_TARGETS[kind].max_sessions is None
+
+
+def test_a_taper_week_with_too_many_sessions_says_so(db):
+    """Áron's real week when this was found: six sessions against a taper's four."""
+    race(db, name="Spar", date="2026-10-11", discipline="running", priority=1)
+    s = _week(db,
+              ("2026-09-28", "09:00", "running", 51, {"load": 155, "z4": 740, "z1": 600, "z2": 1380}),
+              ("2026-09-29", "11:00", "strength_training", 72, {"load": 12}),
+              ("2026-09-29", "22:00", "soccer", 64, {"load": 23, "z1": 600, "z2": 360}),
+              ("2026-09-30", "11:00", "strength_training", 81, {"load": 94, "z4": 324, "z1": 1980}),
+              ("2026-10-01", "11:00", "strength_training", 81, {"load": 12, "z1": 4000}),
+              ("2026-10-02", "12:00", "running", 23, {"load": 80, "z1": 600, "z2": 780}))
+    goal = driving_goal(db, "2026-10-02")
+    target, phase = target_for(goal, "2026-10-02")
+    assert phase == PHASE_TAPER and target.max_sessions == 4
+
+    over = [g for g in gaps(s, target) if g.over]
+    assert len(over) == 1 and over[0].what == "sessions this week"
+    assert (over[0].have, over[0].want) == (6, 4)
+
+    out = " ".join(observations(s, goal, "2026-10-02"))
+    assert "at most 4" in out
+    assert "Coming down is the point" in out, (
+        "the taper's overshoot needs its own sentence — the interference wording "
+        "is about strength and says nothing about tapering")
+
+
+def test_the_two_ceilings_do_not_borrow_each_other_s_sentence(db):
+    """One phrasing for both read as "the interference costs more strength" on a
+    taper week, which is true of neither the cause nor the remedy."""
+    standing(db, "strength")
+    s = _week(db,
+              ("2026-09-28", "18:00", "hiit", 50, {"load": 200, "z4": 1200}),
+              ("2026-09-30", "18:00", "running", 50, {"load": 160, "z4": 1200}))
+    out = " ".join(observations(s, driving_goal(db, "2026-10-02"), "2026-10-02"))
+    assert "interference costs more" in out, "the hard-aerobic ceiling keeps its wording"
+    assert "Coming down is the point" not in out
+
+
+# ---- editing a stored goal -----------------------------------------------
+
+def test_a_target_can_be_added_after_the_race_was_entered(db):
+    """The usual case: the race goes in when it is booked, the target time is
+    settled later. Retiring and re-adding would lose the id and the created date
+    for what is only a correction."""
+    from garmin_mcp.goals import update_goal
+
+    gid = race(db, name="Hyrox BP", date="2026-10-17")
+    assert update_goal(db, gid, target="64:00", notes="Doubles, with Levi") is True
+    g = [x for x in all_goals(db) if x.goal_id == gid][0]
+    assert g.target == "64:00" and g.notes == "Doubles, with Levi"
+    assert g.race_date == "2026-10-17", "nothing else moved"
+
+
+def test_setting_nothing_changes_nothing(db):
+    from garmin_mcp.goals import update_goal
+
+    gid = race(db)
+    assert update_goal(db, gid) is False
+    assert update_goal(db, gid, target=None) is False
+
+
+def test_a_field_that_is_not_editable_is_refused(db):
+    """`active` has retire_goal, and `kind` would strand a goal in a target table
+    that cannot read it."""
+    from garmin_mcp.goals import update_goal
+
+    gid = race(db)
+    with pytest.raises(ValueError, match="active"):
+        update_goal(db, gid, active=0)
+    with pytest.raises(ValueError, match="kind"):
+        update_goal(db, gid, kind="standing")
+
+
+def test_an_invalid_value_is_refused_on_update_too(db):
+    """The add path validates; so must this one, or the same unreadable goal gets
+    in through the back door."""
+    from garmin_mcp.goals import update_goal
+
+    gid = race(db)
+    with pytest.raises(ValueError, match="discipline"):
+        update_goal(db, gid, discipline="underwater_chess")
+    with pytest.raises(ValueError):
+        update_goal(db, gid, race_date="not-a-date")
+
+
+def test_updating_a_goal_that_is_not_there_says_so(db):
+    from garmin_mcp.goals import update_goal
+
+    assert update_goal(db, 9999, target="x") is False
