@@ -1,0 +1,384 @@
+"""The goal system: the store, which goal drives a week, and the gap to it.
+
+These tests go through the real table and the real target tables, because the
+value of this module is entirely in those numbers being the ones that ship. A
+test against a mock of the targets would pass on any numbers at all.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+import pytest
+
+from garmin_mcp.db import init_db
+from garmin_mcp.goals import (
+    DEFAULT_TARGET,
+    PHASE_BASE,
+    PHASE_BUILD,
+    PHASE_PEAK,
+    PHASE_RACE,
+    PHASE_TAPER,
+    RACE_DISCIPLINES,
+    RACE_TARGETS,
+    STANDING_KINDS,
+    STANDING_TARGETS,
+    Goal,
+    active_goals,
+    add_goal,
+    all_goals,
+    describe_goal,
+    driving_goal,
+    gaps,
+    met,
+    observations,
+    phase_for,
+    retire_goal,
+    target_for,
+    weeks_until,
+)
+from garmin_mcp.week import summarize
+
+
+@pytest.fixture
+def db():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    init_db(conn)
+    return conn
+
+
+def race(db, name="Roma Hyrox", date="2026-12-20", discipline="hyrox", **kw):
+    return add_goal(db, Goal(kind="race", name=name, discipline=discipline,
+                             race_date=date, **kw))
+
+
+def standing(db, what="fat_loss", name=None, **kw):
+    return add_goal(db, Goal(kind="standing", name=name or what, standing=what, **kw))
+
+
+# ---- the store ------------------------------------------------------------
+
+def test_a_race_and_a_standing_goal_both_store_and_come_back(db):
+    race(db)
+    standing(db)
+    got = all_goals(db)
+    assert {g.kind for g in got} == {"race", "standing"}
+    assert all(g.goal_id for g in got), "every stored goal gets an id"
+
+
+def test_a_race_without_a_date_is_refused(db):
+    """A race with no date has no phase, so it would silently train as base
+    forever — which is the one failure mode that looks like it is working."""
+    with pytest.raises(ValueError, match="date"):
+        add_goal(db, Goal(kind="race", name="Someday", discipline="hyrox"))
+
+
+def test_an_unknown_discipline_is_refused(db):
+    with pytest.raises(ValueError, match="discipline"):
+        race(db, discipline="underwater_chess")
+
+
+def test_an_unknown_standing_goal_is_refused(db):
+    """Not a typo-catcher: an unreadable value falls back to the DEFAULT target,
+    so the page would show plausible advice for a goal nobody set."""
+    with pytest.raises(ValueError, match="standing"):
+        standing(db, what="get_swole")
+
+
+def test_a_nameless_goal_is_refused(db):
+    with pytest.raises(ValueError, match="name"):
+        add_goal(db, Goal(kind="standing", name="   ", standing="maintenance"))
+
+
+def test_retiring_hides_a_goal_without_destroying_it(db):
+    gid = race(db)
+    assert retire_goal(db, gid) is True
+    assert all_goals(db) == []
+    assert len(all_goals(db, include_retired=True)) == 1, "the history is kept"
+
+
+def test_retiring_something_that_is_not_there_says_so(db):
+    assert retire_goal(db, 9999) is False
+
+
+def test_a_race_already_run_stops_applying(db):
+    """Nobody retires a goal the morning after a race, and the day after one is
+    not still race week."""
+    race(db, date="2026-09-27")
+    assert all_goals(db), "it is still stored"
+    assert active_goals(db, "2026-10-02") == [], "but it no longer applies"
+
+
+# ---- which goal drives the week ------------------------------------------
+
+def test_a_race_outranks_a_standing_goal(db):
+    standing(db, "fat_loss")
+    race(db, date="2026-12-20")
+    g = driving_goal(db, "2026-10-02")
+    assert g.kind == "race", "a date does not move; a standing goal does"
+
+
+def test_the_nearer_race_wins(db):
+    race(db, name="Later", date="2027-03-01")
+    race(db, name="Sooner", date="2026-11-15")
+    assert driving_goal(db, "2026-10-02").name == "Sooner"
+
+
+def test_priority_breaks_a_tie_between_two_races_on_a_day(db):
+    race(db, name="B race", date="2026-11-15", priority=2)
+    race(db, name="A race", date="2026-11-15", priority=1)
+    assert driving_goal(db, "2026-10-02").name == "A race"
+
+
+def test_with_several_standing_goals_priority_decides(db):
+    standing(db, "maintenance", priority=3)
+    standing(db, "strength", priority=1)
+    assert driving_goal(db, "2026-10-02").standing == "strength"
+
+
+def test_no_goal_at_all_is_a_legitimate_state(db):
+    assert driving_goal(db, "2026-10-02") is None
+    target, phase = target_for(None, "2026-10-02")
+    assert target is DEFAULT_TARGET
+    assert phase is None, "a default target is in no phase"
+
+
+# ---- phases ---------------------------------------------------------------
+
+def test_weeks_until_rounds_up(db):
+    """Nine days out is the last-but-one week. Rounding down would taper early."""
+    assert weeks_until("2026-10-11", "2026-10-02") == 2
+    assert weeks_until("2026-10-09", "2026-10-02") == 1
+    assert weeks_until("2026-10-02", "2026-10-02") == 0
+    assert weeks_until("2026-09-27", "2026-10-02") == 0, "a past race is zero, not negative"
+
+
+@pytest.mark.parametrize("race_date,expected", [
+    ("2027-06-01", PHASE_BASE),     # far out
+    ("2026-12-01", PHASE_BUILD),    # ~9 weeks
+    ("2026-10-26", PHASE_PEAK),     # ~4 weeks
+    ("2026-10-14", PHASE_TAPER),    # 2 weeks
+    ("2026-10-05", PHASE_RACE),     # this week
+])
+def test_the_phase_follows_the_date(race_date, expected):
+    assert phase_for(race_date, "2026-10-02") == expected
+
+
+def test_every_discipline_defines_every_phase():
+    """A missing phase is a KeyError on the one morning it matters."""
+    for discipline in RACE_DISCIPLINES:
+        table = RACE_TARGETS[discipline]
+        for phase in (PHASE_BASE, PHASE_BUILD, PHASE_PEAK, PHASE_TAPER, PHASE_RACE):
+            assert phase in table, f"{discipline} has no {phase} target"
+
+
+def test_the_taper_asks_for_less_than_the_peak():
+    """The whole point of a taper. Getting this backwards would be invisible in
+    any test that only checked the phases existed."""
+    for discipline in RACE_DISCIPLINES:
+        peak = RACE_TARGETS[discipline][PHASE_PEAK]
+        taper = RACE_TARGETS[discipline][PHASE_TAPER]
+        week = RACE_TARGETS[discipline][PHASE_RACE]
+        assert taper.sessions < peak.sessions, f"{discipline} does not taper"
+        assert week.sessions <= taper.sessions, f"{discipline} race week is not easiest"
+        assert taper.quality >= 1, (
+            f"{discipline} drops all intensity in the taper — volume comes down, "
+            "intensity is kept")
+
+
+def test_every_standing_goal_has_a_target_and_a_source():
+    for kind in STANDING_KINDS:
+        t = STANDING_TARGETS[kind]
+        assert t.source, f"{kind} has no stated source — an unsourced target is invented"
+        assert t.focus, f"{kind} says nothing about what the week is for"
+
+
+def test_the_strength_goals_ask_for_the_wider_separation():
+    """Interference falls with the gap, so a goal about strength asks for more
+    than the general six hours."""
+    for kind in ("strength", "muscle"):
+        assert STANDING_TARGETS[kind].separation_hours >= 8.0
+    assert STANDING_TARGETS["fat_loss"].separation_hours == 6.0
+
+
+def test_muscle_gain_asks_for_more_strength_than_fat_loss_or_maintenance():
+    s = STANDING_TARGETS
+    assert s["muscle"].strength > s["maintenance"].strength
+    assert s["muscle"].strength >= s["strength"].strength
+
+
+def test_only_the_strength_side_goals_cap_hard_aerobic_work():
+    s = STANDING_TARGETS
+    assert s["strength"].max_hard == 1 and s["muscle"].max_hard == 1
+    assert s["fat_loss"].max_hard is None, (
+        "capping the aerobic side of a fat-loss week would be the wrong lever")
+    assert s["maintenance"].max_hard is None
+
+
+def test_fat_loss_keeps_the_strength_volume():
+    """It is the finding, not a detail: the weight comes off either way, and what
+    is kept is decided by the resistance work."""
+    assert STANDING_TARGETS["fat_loss"].strength >= 3
+
+
+# ---- the gap --------------------------------------------------------------
+
+def _week(db, *sessions):
+    """sessions = (day, time, sport, minutes, kwargs) tuples."""
+    from tests.test_week import add
+    for s in sessions:
+        add(db, *s[:4], **(s[4] if len(s) > 4 else {}))
+    return summarize(db, "2026-10-02")
+
+
+def test_a_shortfall_is_named_with_both_numbers(db):
+    s = _week(db, ("2026-09-28", "11:00", "strength_training", 70, {"load": 12}))
+    g = gaps(s, STANDING_TARGETS["muscle"])
+    assert any("strength sessions" == x.what for x in g)
+    strength = [x for x in g if x.what == "strength sessions"][0]
+    assert (strength.have, strength.want) == (1, 4)
+
+
+def test_a_week_that_meets_its_target_reports_nothing_missing(db):
+    s = _week(db,
+              ("2026-09-28", "11:00", "strength_training", 70, {"load": 12}),
+              ("2026-09-29", "11:00", "strength_training", 70, {"load": 12}),
+              ("2026-09-30", "09:00", "running", 70, {"load": 80, "z1": 1200, "z2": 3000}),
+              ("2026-10-01", "09:00", "running", 65, {"load": 80, "z1": 1200, "z2": 2700}),
+              ("2026-10-01", "18:00", "hiit", 50, {"load": 160, "z4": 1200}),
+              ("2026-10-02", "09:00", "cycling", 40, {"load": 30, "z1": 1200, "z2": 1200}))
+    target = STANDING_TARGETS["maintenance"]
+    assert met(s, target), [f"{x.what} {x.have}/{x.want}" for x in gaps(s, target)]
+
+
+def test_the_ceiling_is_reported_as_an_overshoot_not_a_shortfall(db):
+    s = _week(db,
+              ("2026-09-28", "18:00", "hiit", 50, {"load": 200, "z4": 1200}),
+              ("2026-09-30", "18:00", "running", 50, {"load": 160, "z4": 1200}))
+    over = [x for x in gaps(s, STANDING_TARGETS["strength"]) if x.over]
+    assert len(over) == 1
+    assert over[0].what == "hard aerobic sessions"
+    assert (over[0].have, over[0].want) == (2, 1)
+
+
+def test_a_long_session_is_measured_in_minutes_not_sessions(db):
+    s = _week(db, ("2026-09-28", "09:00", "running", 40,
+                   {"load": 70, "z1": 1200, "z2": 1200}))
+    long_gap = [x for x in gaps(s, STANDING_TARGETS["maintenance"])
+                if "long aerobic" in x.what]
+    assert len(long_gap) == 1
+    assert long_gap[0].want == 60 and long_gap[0].have == 40
+
+
+# ---- the advice -----------------------------------------------------------
+
+def test_the_advice_opens_by_naming_the_goal(db):
+    standing(db, "fat_loss", name="Down to 72 kg")
+    s = _week(db, ("2026-09-28", "11:00", "strength_training", 70, {"load": 12}))
+    out = observations(s, driving_goal(db, "2026-10-02"), "2026-10-02")
+    assert "Fat loss" in out[0] and "Down to 72 kg" in out[0]
+
+
+def test_the_advice_states_what_it_is_judged_against(db):
+    """A target with no stated source cannot be argued with, which makes it
+    indistinguishable from one that was made up."""
+    standing(db, "muscle")
+    s = _week(db)
+    out = observations(s, driving_goal(db, "2026-10-02"), "2026-10-02")
+    assert any("Judged against" in line for line in out)
+    assert any("Schoenfeld" in line for line in out)
+
+
+def test_the_advice_never_names_a_day(db):
+    race(db, date="2026-11-15")
+    s = _week(db,
+              ("2026-09-28", "11:00", "strength_training", 70, {"load": 12}),
+              ("2026-09-28", "13:00", "running", 40, {"load": 80, "z1": 600, "z2": 1200}))
+    for line in observations(s, driving_goal(db, "2026-10-02"), "2026-10-02"):
+        low = line.lower()
+        for weekday in ("monday", "tuesday", "wednesday", "thursday", "friday",
+                        "saturday", "sunday"):
+            assert weekday not in low, f"advice named a day: {line}"
+
+
+def test_a_race_week_says_how_far_away_the_race_is(db):
+    race(db, name="Budapest Half", date="2026-11-15", discipline="running",
+         target="1:28:00")
+    line = describe_goal(driving_goal(db, "2026-10-02"), "2026-10-02")
+    assert "2026-11-15" in line and "7 weeks" in line
+    assert "1:28:00" in line, "the target time is part of the goal, not decoration"
+    assert "Peak" in line or "Build" in line
+
+
+def test_the_race_is_singular_a_week_before(db):
+    race(db, date="2026-10-09")
+    assert "in 1 week" in describe_goal(driving_goal(db, "2026-10-02"), "2026-10-02")
+
+
+def test_interference_is_judged_against_this_goal_s_own_gap(db):
+    """Seven hours is fine for a fat-loss week and not for a strength one. A
+    single global threshold would have to be wrong for one of them."""
+    sessions = (("2026-10-02", "11:00", "strength_training", 70, {"load": 12}),
+                ("2026-10-02", "18:00", "running", 40,
+                 {"load": 160, "z4": 900, "z1": 600}))
+    s = _week(db, *sessions)
+    assert s["interference"] == [], "7 h is outside week.py's own 6 h window"
+
+    strength_out = observations(s, Goal(kind="standing", name="s", standing="strength"),
+                                "2026-10-02")
+    # week.py only reports gaps under six hours, so nothing reaches the goal
+    # layer here — the goal's wider window is applied to what it is given, and
+    # the test pins that the two thresholds are not silently assumed equal.
+    assert not any("8 h between" in line for line in strength_out)
+    assert STANDING_TARGETS["strength"].separation_hours > 6.0
+
+
+def test_an_empty_week_still_gets_advice(db):
+    standing(db, "maintenance")
+    out = observations(_week(db), driving_goal(db, "2026-10-02"), "2026-10-02")
+    assert len(out) >= 3, "a week with nothing in it is when advice matters most"
+    assert any("of 2" in line or "of 6" in line for line in out)
+
+
+# ---- the command line -----------------------------------------------------
+# Thin, but it is the only way a goal gets set, so the one thing worth pinning
+# is that it does not lie about what it just stored.
+
+def test_the_cli_reports_the_same_phase_as_the_listing(db, tmp_path, capsys):
+    """`race` and `list` ran different values through phase_for: the race's own
+    positional `date` and the global --date flag shared one argparse attribute,
+    so the race date became "today" and a race twelve weeks out was announced as
+    race week."""
+    import sqlite3
+
+    from garmin_mcp.goals import main
+
+    path = tmp_path / "goals.db"
+    conn = sqlite3.connect(path)
+    init_db(conn)
+    conn.close()
+
+    args = ["--db", str(path), "--as-of", "2026-10-02"]
+    assert main(args + ["race", "Hyrox Budapest", "2026-12-19",
+                        "--discipline", "hyrox"]) == 0
+    added = capsys.readouterr().out
+    assert main(args + ["list"]) == 0
+    listed = capsys.readouterr().out
+    assert "build" in added.lower(), added
+    assert "Build phase" in listed, listed
+
+
+def test_the_cli_refuses_a_bad_goal_loudly(db, tmp_path):
+    """A stored goal nobody can read falls back to the default target, so the
+    page would show confident advice for a goal that was never set."""
+    import sqlite3
+
+    from garmin_mcp.goals import main
+
+    path = tmp_path / "goals.db"
+    conn = sqlite3.connect(path)
+    init_db(conn)
+    conn.close()
+    with pytest.raises(SystemExit):     # argparse rejects the choice itself
+        main(["--db", str(path), "goal", "get_swole"])

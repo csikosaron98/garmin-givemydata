@@ -1,0 +1,592 @@
+"""What the athlete is training FOR, and what that asks of a week.
+
+The week module says what a week CONTAINS. This one says what it should contain,
+which is a different question and has a different answer depending on the goal.
+A race is a date with a shape that changes as it approaches; a standing goal —
+maintenance, strength, muscle, fat loss — has no date and the same shape every
+week.
+
+Three deliberate choices:
+
+1. **A goal is never required.** Without one the week is still described and
+   still compared against a sensible default, because "set a goal first" is a
+   useless answer to "how is my week going".
+
+2. **The targets are expressed in the same five qualities week.py classifies
+   into.** A goal that asked for "3 runs" would need a second classifier, and
+   two classifiers disagree sooner or later. A goal asks for aerobic base,
+   quality, strength — which is also what the body responds to.
+
+3. **Advisory, not prescriptive.** A target is a number to compare against, not
+   a schedule. Nothing here names a day: which day a session lands on is
+   settled on the day, usually by work and weather.
+
+Nothing here is medical advice, and nothing here prescribes food.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import sqlite3
+from dataclasses import dataclass, field
+
+# ---------------------------------------------------------------------------
+# the vocabulary
+# ---------------------------------------------------------------------------
+
+RACE_DISCIPLINES = ("hyrox", "running", "ironman", "other")
+STANDING_KINDS = ("maintenance", "strength", "muscle", "fat_loss")
+
+STANDING_LABELS = {
+    "maintenance": "Maintenance",
+    "strength": "Strength gain",
+    "muscle": "Muscle gain",
+    "fat_loss": "Fat loss",
+}
+
+DISCIPLINE_LABELS = {
+    "hyrox": "HYROX",
+    "running": "Running race",
+    "ironman": "Ironman",
+    "other": "Race",
+}
+
+# Phase boundaries in weeks remaining. These are the conventional blocks of a
+# linear periodisation; the names are what the plan literature calls them.
+PHASE_BASE = "base"
+PHASE_BUILD = "build"
+PHASE_PEAK = "peak"
+PHASE_TAPER = "taper"
+PHASE_RACE = "race_week"
+
+PHASE_LABELS = {
+    PHASE_BASE: "Base",
+    PHASE_BUILD: "Build",
+    PHASE_PEAK: "Peak",
+    PHASE_TAPER: "Taper",
+    PHASE_RACE: "Race week",
+}
+
+# Five phases need four boundaries, each read as "fewer than this many whole
+# weeks remain". The 13-week outer edge is deliberate: the published 12-week
+# race blocks start where this one ends, so "base" is what a week is before any
+# block has begun, not a phase inside one.
+RACE_WEEK_UNDER = 2     # the last seven days, and the race day itself
+TAPER_UNDER = 4         # two weeks of coming down
+PEAK_UNDER = 7          # the three hardest weeks
+BUILD_UNDER = 13        # the race-specific block
+
+
+@dataclass(frozen=True)
+class WeeklyTarget:
+    """What one goal asks of one week. Every field is a floor except max_hard."""
+
+    sessions: int
+    base: int
+    quality: int
+    strength: int
+    long_minutes: int
+    # A CEILING, not a floor, and only the strength-side goals set one: beyond
+    # about one hard aerobic session a week the interference starts to cost more
+    # strength than the aerobic work is worth to that goal. None = no ceiling.
+    max_hard: int | None = None
+    # The separation this goal cares about between resistance work and hard
+    # endurance work. Six hours is where interference becomes measurable; past
+    # eight it is minimal, so a strength goal asks for the wider gap.
+    separation_hours: float = 6.0
+    # One line, in the athlete's language, saying what this week is for.
+    focus: str = ""
+    # Where the numbers come from. Printed with the advice, because a target
+    # nobody can check is indistinguishable from one that was invented.
+    source: str = ""
+
+
+# ---------------------------------------------------------------------------
+# what each goal asks of a week
+# ---------------------------------------------------------------------------
+# Races change shape as the date approaches, so they are a phase → target map.
+# Standing goals do not, so they are a single target.
+#
+# Six sessions a week is the assumption throughout, because that is what Áron
+# actually trains, football and hiking included. A plan built for ten would be
+# arithmetically correct and useless.
+
+_HYROX_SOURCE = ("HYROX coaching consensus: three runs a week — one easy Z2, one "
+                 "interval, one compromised run — alongside two to three strength "
+                 "or station sessions")
+
+RACE_TARGETS: dict[str, dict[str, WeeklyTarget]] = {
+    "hyrox": {
+        PHASE_BASE: WeeklyTarget(6, base=3, quality=1, strength=2, long_minutes=75,
+                                 focus="Aerobic base and strength, before the race-specific work",
+                                 source=_HYROX_SOURCE),
+        PHASE_BUILD: WeeklyTarget(6, base=2, quality=2, strength=2, long_minutes=70,
+                                  focus="The race shape: a compromised run every week",
+                                  source=_HYROX_SOURCE),
+        PHASE_PEAK: WeeklyTarget(6, base=2, quality=2, strength=2, long_minutes=60,
+                                 focus="Race pace and the stations under fatigue",
+                                 source=_HYROX_SOURCE),
+        PHASE_TAPER: WeeklyTarget(4, base=2, quality=1, strength=1, long_minutes=45,
+                                  focus="Volume down, intensity kept — sharpness is not lost in two weeks, freshness is gained",
+                                  source=_HYROX_SOURCE),
+        PHASE_RACE: WeeklyTarget(3, base=1, quality=1, strength=1, long_minutes=0,
+                                 focus="Short and easy. Nothing this week makes you fitter; several things can make you slower",
+                                 source=_HYROX_SOURCE),
+    },
+    # 80/20: most of the week easy, one or two quality sessions, and the long run
+    # is the session the distance is actually built on.
+    "running": {
+        PHASE_BASE: WeeklyTarget(6, base=4, quality=1, strength=1, long_minutes=90,
+                                 focus="Easy volume, and the long run growing",
+                                 source="80/20 polarised distribution; the long run as the distance-specific session"),
+        PHASE_BUILD: WeeklyTarget(6, base=3, quality=2, strength=1, long_minutes=105,
+                                  focus="Threshold and interval work on top of the base",
+                                  source="80/20 polarised distribution"),
+        PHASE_PEAK: WeeklyTarget(6, base=3, quality=2, strength=1, long_minutes=120,
+                                 focus="Race-pace work inside the long run",
+                                 source="80/20 polarised distribution"),
+        PHASE_TAPER: WeeklyTarget(4, base=3, quality=1, strength=1, long_minutes=60,
+                                  focus="Volume down about 40%, one short quality session kept",
+                                  source="80/20 polarised distribution"),
+        PHASE_RACE: WeeklyTarget(3, base=2, quality=1, strength=0, long_minutes=0,
+                                 focus="Easy, short, and off your feet otherwise",
+                                 source="80/20 polarised distribution"),
+    },
+    # Three disciplines in six sessions is already a compromise, and the advice
+    # says so rather than pretending the week is sufficient.
+    "ironman": {
+        PHASE_BASE: WeeklyTarget(6, base=4, quality=1, strength=1, long_minutes=150,
+                                 focus="Aerobic volume across all three disciplines",
+                                 source="Long-course triathlon periodisation: aerobic volume first, one long session per week"),
+        PHASE_BUILD: WeeklyTarget(7, base=4, quality=2, strength=1, long_minutes=210,
+                                  focus="The long ride, and race nutrition rehearsed on it",
+                                  source="Long-course triathlon periodisation"),
+        PHASE_PEAK: WeeklyTarget(7, base=4, quality=2, strength=1, long_minutes=270,
+                                 focus="The longest sessions of the whole build",
+                                 source="Long-course triathlon periodisation"),
+        PHASE_TAPER: WeeklyTarget(5, base=3, quality=1, strength=1, long_minutes=90,
+                                  focus="Three weeks of coming down, not one",
+                                  source="Long-course triathlon periodisation"),
+        PHASE_RACE: WeeklyTarget(3, base=2, quality=1, strength=0, long_minutes=0,
+                                 focus="Openers only",
+                                 source="Long-course triathlon periodisation"),
+    },
+    "other": {
+        PHASE_BASE: WeeklyTarget(6, base=3, quality=1, strength=2, long_minutes=60,
+                                 focus="Aerobic base and strength",
+                                 source="General preparation, no discipline given"),
+        PHASE_BUILD: WeeklyTarget(6, base=2, quality=2, strength=2, long_minutes=60,
+                                  focus="More specific work, same volume",
+                                  source="General preparation, no discipline given"),
+        PHASE_PEAK: WeeklyTarget(6, base=2, quality=2, strength=2, long_minutes=60,
+                                 focus="Sharpening",
+                                 source="General preparation, no discipline given"),
+        PHASE_TAPER: WeeklyTarget(4, base=2, quality=1, strength=1, long_minutes=45,
+                                  focus="Volume down, intensity kept",
+                                  source="General preparation, no discipline given"),
+        PHASE_RACE: WeeklyTarget(3, base=1, quality=1, strength=1, long_minutes=0,
+                                 focus="Short and easy",
+                                 source="General preparation, no discipline given"),
+    },
+}
+
+STANDING_TARGETS: dict[str, WeeklyTarget] = {
+    "maintenance": WeeklyTarget(
+        6, base=2, quality=1, strength=2, long_minutes=60,
+        focus="Hold what is there: one long easy session, one hard one, two in the gym",
+        source="Minimum effective dose: fitness is maintained on markedly less work "
+               "than it was built with, provided the intensity is kept"),
+    # Hard aerobic work is capped rather than removed: one session a week keeps
+    # the aerobic side alive at a cost the strength side can absorb.
+    "strength": WeeklyTarget(
+        6, base=2, quality=1, strength=3, long_minutes=60, max_hard=1,
+        separation_hours=8.0,
+        focus="Three strength sessions, and the hard aerobic work kept to one and "
+              "held well away from them",
+        source="Wilson et al. meta-analysis: concurrent endurance work costs 5-10% of "
+               "maximal strength gain, and the cost falls with the gap — minimal past 8 h"),
+    # Four sessions, because frequency is what gets each muscle group trained
+    # twice a week, and twice beats once at matched volume.
+    "muscle": WeeklyTarget(
+        6, base=2, quality=1, strength=4, long_minutes=45, max_hard=1,
+        separation_hours=8.0,
+        focus="Four strength sessions so every muscle group is trained twice, 10-20 "
+              "hard sets each across the week",
+        source="Schoenfeld et al.: a dose-response to weekly sets with 10+ sets per "
+               "muscle group, diminishing past ~20; twice-weekly frequency beats "
+               "once-weekly at matched volume"),
+    # The strength volume is the point, not a side note: it is what the research
+    # ties to keeping lean mass while the weight comes down.
+    "fat_loss": WeeklyTarget(
+        6, base=3, quality=1, strength=3, long_minutes=60,
+        focus="Keep the strength volume and the easy volume — the weight comes off "
+              "either way, what is kept is decided by the training",
+        source="Murphy & Koehler, and Roth et al.: resistance training at 10+ weekly "
+               "sets per muscle group in a deficit shows little to no lean-mass loss; "
+               "~0.5-1% of body weight per week is the band associated with retaining it"),
+}
+
+# Without any goal at all. Not nothing — the same week still deserves a reading,
+# and this is the shape of a balanced week for someone training six times.
+DEFAULT_TARGET = WeeklyTarget(
+    6, base=2, quality=1, strength=2, long_minutes=60,
+    focus="No goal set — judged against a balanced week",
+    source="80/20 distribution with resistance work twice a week")
+
+
+# ---------------------------------------------------------------------------
+# the store
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Goal:
+    goal_id: int | None = None
+    kind: str = "standing"
+    name: str = ""
+    discipline: str | None = None
+    standing: str | None = None
+    race_date: str | None = None
+    target: str | None = None
+    priority: int = 2
+    active: bool = True
+    created: str = ""
+    notes: str | None = None
+
+    @property
+    def label(self) -> str:
+        if self.kind == "race":
+            return DISCIPLINE_LABELS.get(self.discipline or "other", "Race")
+        return STANDING_LABELS.get(self.standing or "", "Goal")
+
+
+def _row_to_goal(row) -> Goal:
+    return Goal(
+        goal_id=row["goal_id"], kind=row["kind"], name=row["name"],
+        discipline=row["discipline"], standing=row["standing"],
+        race_date=row["race_date"], target=row["target"],
+        priority=row["priority"], active=bool(row["active"]),
+        created=row["created"], notes=row["notes"])
+
+
+def add_goal(conn: sqlite3.Connection, goal: Goal) -> int:
+    """Store one goal. Validated here, because a goal the targets cannot read is
+    worse than no goal: it would silently fall back to the default."""
+    if goal.kind not in ("race", "standing"):
+        raise ValueError(f"kind must be 'race' or 'standing', not {goal.kind!r}")
+    if not (goal.name or "").strip():
+        raise ValueError("a goal needs a name")
+    if goal.kind == "race":
+        if goal.discipline not in RACE_DISCIPLINES:
+            raise ValueError(f"discipline must be one of {RACE_DISCIPLINES}")
+        if not goal.race_date:
+            raise ValueError("a race needs a date")
+        _dt.date.fromisoformat(goal.race_date)      # raises on a bad date
+    else:
+        if goal.standing not in STANDING_KINDS:
+            raise ValueError(f"standing must be one of {STANDING_KINDS}")
+    created = goal.created or _dt.date.today().isoformat()
+    cur = conn.execute(
+        "INSERT INTO training_goal (kind, name, discipline, standing, race_date, "
+        "target, priority, active, created, notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (goal.kind, goal.name.strip(), goal.discipline, goal.standing,
+         goal.race_date, goal.target, goal.priority, 1 if goal.active else 0,
+         created, goal.notes))
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def retire_goal(conn: sqlite3.Connection, goal_id: int) -> bool:
+    """Deactivate rather than delete: a race that has been run is history worth
+    keeping, and the week it was run in still has to be explicable later."""
+    cur = conn.execute("UPDATE training_goal SET active = 0 WHERE goal_id = ?",
+                       (goal_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def all_goals(conn: sqlite3.Connection, *, include_retired: bool = False) -> list[Goal]:
+    conn.row_factory = sqlite3.Row
+    sql = ("SELECT * FROM training_goal"
+           + ("" if include_retired else " WHERE active = 1")
+           + " ORDER BY priority, COALESCE(race_date, '9999-12-31'), goal_id")
+    return [_row_to_goal(r) for r in conn.execute(sql)]
+
+
+def active_goals(conn: sqlite3.Connection, date: str) -> list[Goal]:
+    """Goals that still apply on `date`. A race in the past no longer does, even
+    if nobody has got round to retiring it — the day after a race is not still
+    race week."""
+    out = []
+    for g in all_goals(conn):
+        if g.kind == "race" and g.race_date and g.race_date < date:
+            continue
+        out.append(g)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# which goal drives this week
+# ---------------------------------------------------------------------------
+
+def weeks_until(race_date: str, date: str) -> int:
+    """Whole weeks from `date` to the race, rounded UP.
+
+    Rounded up on purpose: with nine days to go you are in the last-but-one
+    week, and calling that "one week" would taper a week early.
+    """
+    d0 = _dt.date.fromisoformat(date)
+    d1 = _dt.date.fromisoformat(race_date)
+    days = (d1 - d0).days
+    if days <= 0:
+        return 0
+    return -(-days // 7)
+
+
+def phase_for(race_date: str, date: str) -> str:
+    """Which block of the plan this week falls in, from the date alone.
+
+    The ladder is checked from the race backwards, so each boundary means "and
+    nothing nearer" — getting the order wrong is how a peak week ends up labelled
+    as a taper, which is exactly the mistake that costs a race.
+    """
+    w = weeks_until(race_date, date)
+    if w < RACE_WEEK_UNDER:
+        return PHASE_RACE
+    if w < TAPER_UNDER:
+        return PHASE_TAPER
+    if w < PEAK_UNDER:
+        return PHASE_PEAK
+    if w < BUILD_UNDER:
+        return PHASE_BUILD
+    return PHASE_BASE
+
+
+def driving_goal(conn: sqlite3.Connection, date: str) -> Goal | None:
+    """The one goal this week is shaped by.
+
+    The nearest race wins over any standing goal, because a date does not move.
+    Between two races the earlier one wins, and at equal dates the higher
+    priority. With no race, the first standing goal by priority.
+    """
+    goals = active_goals(conn, date)
+    races = [g for g in goals if g.kind == "race" and g.race_date]
+    if races:
+        races.sort(key=lambda g: (g.race_date, g.priority, g.goal_id or 0))
+        return races[0]
+    standing = [g for g in goals if g.kind == "standing"]
+    if standing:
+        standing.sort(key=lambda g: (g.priority, g.goal_id or 0))
+        return standing[0]
+    return None
+
+
+def target_for(goal: Goal | None, date: str) -> tuple[WeeklyTarget, str | None]:
+    """The week's target, and the phase it came from (None for a standing goal)."""
+    if goal is None:
+        return DEFAULT_TARGET, None
+    if goal.kind == "race" and goal.race_date:
+        phase = phase_for(goal.race_date, date)
+        table = RACE_TARGETS.get(goal.discipline or "other", RACE_TARGETS["other"])
+        return table[phase], phase
+    return STANDING_TARGETS.get(goal.standing or "", DEFAULT_TARGET), None
+
+
+# ---------------------------------------------------------------------------
+# the week against the target
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Gap:
+    """One shortfall or overshoot, named so it can be printed in any order."""
+
+    what: str
+    have: float
+    want: float
+    over: bool = False        # True when the target is a ceiling, not a floor
+
+
+def gaps(summary: dict, target: WeeklyTarget) -> list[Gap]:
+    """Where the week stands against the target. Shortfalls first, then ceilings
+    that have been exceeded. An empty list means the week has met its goal."""
+    c = summary["counts"]
+    out: list[Gap] = []
+    if c["aerobic_base"] < target.base:
+        out.append(Gap("aerobic base sessions", c["aerobic_base"], target.base))
+    if c["aerobic_quality"] < target.quality:
+        out.append(Gap("quality sessions", c["aerobic_quality"], target.quality))
+    if c["strength"] < target.strength:
+        out.append(Gap("strength sessions", c["strength"], target.strength))
+    if target.long_minutes and summary["longest_base_minutes"] < target.long_minutes:
+        out.append(Gap("a long aerobic session, in minutes",
+                       summary["longest_base_minutes"], target.long_minutes))
+    if summary["sessions"] < target.sessions:
+        out.append(Gap("sessions in total", summary["sessions"], target.sessions))
+    if target.max_hard is not None and c["aerobic_quality"] > target.max_hard:
+        out.append(Gap("hard aerobic sessions", c["aerobic_quality"],
+                       target.max_hard, over=True))
+    return out
+
+
+def met(summary: dict, target: WeeklyTarget) -> bool:
+    return not gaps(summary, target)
+
+
+def describe_goal(goal: Goal | None, date: str) -> str:
+    """One line naming the goal and where in it this week sits."""
+    if goal is None:
+        return "No goal set — the week is read against a balanced one."
+    if goal.kind == "race" and goal.race_date:
+        w = weeks_until(goal.race_date, date)
+        phase = PHASE_LABELS[phase_for(goal.race_date, date)]
+        when = "this week" if w == 0 else (f"in {w} week" if w == 1 else f"in {w} weeks")
+        tgt = f", target {goal.target}" if goal.target else ""
+        return (f"{goal.label}: {goal.name}, {goal.race_date} — {when}. "
+                f"{phase} phase{tgt}.")
+    return f"{goal.label}: {goal.name}."
+
+
+def observations(summary: dict, goal: Goal | None, date: str) -> list[str]:
+    """Plain statements about the week against its goal, strongest first.
+
+    Advisory by construction: it names what is missing and what it is judged
+    against, and never says which day to do it on.
+    """
+    target, _phase = target_for(goal, date)
+    out: list[str] = [describe_goal(goal, date)]
+    if target.focus:
+        out.append(f"This week is for: {target.focus}.")
+
+    shortfalls = gaps(summary, target)
+    if not shortfalls:
+        out.append(f"The week has met its goal: {summary['sessions']} sessions, "
+                   f"{summary['total_minutes']} min.")
+    for g in shortfalls:
+        if g.over:
+            out.append(f"{g.what}: {g.have:.0f}, and this goal asks for at most "
+                       f"{g.want:.0f} — past that the interference costs more "
+                       f"strength than the aerobic work is worth here.")
+        else:
+            out.append(f"{g.what}: {g.have:.0f} of {g.want:.0f}.")
+
+    # Interference is reported against the gap THIS goal cares about, which is
+    # wider for the strength-side goals than the general six hours.
+    for day in summary["interference"]:
+        if day["gap_hours"] < target.separation_hours:
+            out.append(
+                f"{day['d']}: {' + '.join(day['sports'])} {day['gap_hours']} h apart. "
+                f"This goal asks for {target.separation_hours:.0f} h between "
+                "resistance and hard endurance work.")
+
+    if target.source:
+        out.append(f"Judged against: {target.source}.")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# the command line
+# ---------------------------------------------------------------------------
+# Goals are set from Áron's own terminal, never from the page: the dashboard
+# reads this table through garmin_query, which is a read-only connection, and
+# that is what makes publishing it acceptable. Giving the page a write tool to
+# save typing would be a poor trade.
+
+def _fmt_goal(g: Goal, date: str) -> str:
+    head = f"  [{g.goal_id}] {g.label}: {g.name}"
+    if g.kind == "race" and g.race_date:
+        w = weeks_until(g.race_date, date)
+        head += (f"  {g.race_date} ({w} week{'' if w == 1 else 's'}, "
+                 f"{PHASE_LABELS[phase_for(g.race_date, date)].lower()})")
+    if g.target:
+        head += f"  target {g.target}"
+    if not g.active:
+        head += "  [retired]"
+    return head
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    from .db import DB_PATH, get_connection
+
+    ap = argparse.ArgumentParser(
+        prog="python -m garmin_mcp.goals",
+        description="Set what the training is for. The dashboard and the morning "
+                    "brief both read these.")
+    ap.add_argument("--db", default=DB_PATH, help=f"database (default: {DB_PATH})")
+    # NOT --date: the `race` subcommand takes a positional `date`, and argparse
+    # writes both to the same attribute. The race's own date then became "today",
+    # so adding a race twelve weeks out reported it as race week.
+    ap.add_argument("--as-of", dest="as_of", default=None,
+                    help="pretend today is this ISO date")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("list", help="show the goals, and this week's target")
+    p.add_argument("--all", action="store_true", help="include retired goals")
+
+    p = sub.add_parser("race", help="add a race")
+    p.add_argument("name")
+    p.add_argument("date", help="ISO date of the race")
+    p.add_argument("--discipline", choices=RACE_DISCIPLINES, default="other")
+    p.add_argument("--target", default=None, help="e.g. 65:00, sub-3:30")
+    p.add_argument("--priority", type=int, default=2, help="1 = A race (default 2)")
+    p.add_argument("--notes", default=None)
+
+    p = sub.add_parser("goal", help="add a standing goal")
+    p.add_argument("standing", choices=STANDING_KINDS)
+    p.add_argument("--name", default=None, help="defaults to the kind")
+    p.add_argument("--target", default=None, help="e.g. 72 kg")
+    p.add_argument("--priority", type=int, default=2)
+    p.add_argument("--notes", default=None)
+
+    p = sub.add_parser("retire", help="deactivate a goal, keeping its history")
+    p.add_argument("goal_id", type=int)
+
+    a = ap.parse_args(argv)
+    today = a.as_of or _dt.date.today().isoformat()
+    conn = get_connection(a.db)
+
+    if a.cmd == "list":
+        goals = all_goals(conn, include_retired=a.all)
+        if not goals:
+            print("No goals set. The week is read against a balanced one.")
+        else:
+            print("Goals:")
+            for g in goals:
+                print(_fmt_goal(g, today))
+        drive = driving_goal(conn, today)
+        target, phase = target_for(drive, today)
+        print(f"\nThis week ({today}) is judged against:")
+        print(f"  {describe_goal(drive, today)}")
+        print(f"  {target.sessions} sessions — {target.base} aerobic base, "
+              f"{target.quality} quality, {target.strength} strength"
+              + (f", longest {target.long_minutes} min" if target.long_minutes else "")
+              + (f", at most {target.max_hard} hard aerobic" if target.max_hard is not None else ""))
+        print(f"  {target.separation_hours:.0f} h between resistance and hard endurance work")
+        print(f"  Source: {target.source}")
+        return 0
+
+    if a.cmd == "race":
+        gid = add_goal(conn, Goal(kind="race", name=a.name, discipline=a.discipline,
+                                  race_date=a.date, target=a.target,
+                                  priority=a.priority, notes=a.notes))
+        print(f"Added race [{gid}]: {a.name}, {a.date} "
+              f"({PHASE_LABELS[phase_for(a.date, today)].lower()} phase this week)")
+        return 0
+
+    if a.cmd == "goal":
+        gid = add_goal(conn, Goal(kind="standing", name=a.name or STANDING_LABELS[a.standing],
+                                  standing=a.standing, target=a.target,
+                                  priority=a.priority, notes=a.notes))
+        print(f"Added goal [{gid}]: {STANDING_LABELS[a.standing]}")
+        return 0
+
+    if a.cmd == "retire":
+        print(f"Retired goal {a.goal_id}." if retire_goal(conn, a.goal_id)
+              else f"No goal with id {a.goal_id}.")
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":       # pragma: no cover - a thin argparse wrapper
+    raise SystemExit(main())

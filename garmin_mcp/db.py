@@ -793,6 +793,27 @@ CREATE TABLE IF NOT EXISTS hrv_timeline (
     raw_json        TEXT
 );
 
+-- The athlete's own goals. This is the ONE table in this database that Garmin
+-- does not fill: it is written here and read by two consumers, the morning
+-- brief and the published dashboard. It lives in the database rather than in a
+-- config file precisely because the dashboard can only see the database, and
+-- the page and the email describing the same week against different goals
+-- would be worse than either being wrong alone.
+CREATE TABLE IF NOT EXISTS training_goal (
+    goal_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,          -- 'race' | 'standing'
+    name        TEXT NOT NULL,
+    discipline  TEXT,                   -- race: hyrox | running | ironman | other
+    standing    TEXT,                   -- maintenance | strength | muscle | fat_loss
+    race_date   TEXT,                   -- ISO date, races only
+    target      TEXT,                   -- free text, e.g. '65:00', 'sub-3:30'
+    priority    INTEGER NOT NULL DEFAULT 2,   -- 1 = A race, 2 = B, 3 = C
+    active      INTEGER NOT NULL DEFAULT 1,
+    created     TEXT NOT NULL,
+    notes       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_goal_active ON training_goal (active, priority, race_date);
 CREATE INDEX IF NOT EXISTS idx_act_weather ON activity_weather (activity_id);
 CREATE INDEX IF NOT EXISTS idx_trackpoints_activity ON activity_trackpoints (activity_id);
 """
