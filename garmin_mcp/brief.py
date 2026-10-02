@@ -35,6 +35,7 @@ import os
 import smtplib
 import sqlite3
 from email.message import EmailMessage
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from .db import DB_PATH, get_connection
@@ -57,8 +58,14 @@ ZONES = {
 
 # Only send inside a plausible morning. Outside it the night's figures are no
 # longer "this morning's", and a brief that says they are would be wrong.
+#
+# In ÁRON's morning, not the server's: the VM runs on UTC, so a naive
+# datetime.now() made this 07:00-13:00 Budapest in summer and 06:00-12:00 in
+# winter — an early riser would have waited hours for a brief about a night that
+# had already landed.
 SEND_FROM_HOUR = 5
 SEND_TO_HOUR = 11
+DEFAULT_TZ = "Europe/Budapest"
 
 SENT_MARKER = ".brief-sent"
 
@@ -442,6 +449,20 @@ def mark_sent(date: str, path: Path) -> None:
         log.warning("could not write the sent marker at %s: %s", path, exc)
 
 
+def local_now(tz_name: str | None = None) -> _dt.datetime:
+    """Now, in the athlete's timezone — never the server's.
+
+    Falls back to the server clock only if the zone is unknown, which on a Linux
+    box means the tz database is missing rather than the name being wrong.
+    """
+    name = tz_name or os.environ.get("BRIEF_TZ", DEFAULT_TZ)
+    try:
+        return _dt.datetime.now(ZoneInfo(name))
+    except Exception as exc:
+        log.warning("unknown timezone %r (%s) — falling back to the server clock", name, exc)
+        return _dt.datetime.now()
+
+
 def in_send_window(now: _dt.datetime) -> bool:
     return SEND_FROM_HOUR <= now.hour < SEND_TO_HOUR
 
@@ -485,7 +506,7 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     load_env()
 
-    now = _dt.datetime.now()
+    now = local_now()
     date = args.date or now.date().isoformat()
     marker = marker_path()
 

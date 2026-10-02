@@ -277,3 +277,30 @@ def test_the_html_carries_no_unresolved_placeholders(db):
     _, _, html = build(db, "2026-10-02")
     assert "{" not in html.replace("{", "", 0) or "None" not in html
     assert "None" not in html, "a missing value must render as a dash, not as the word None"
+
+
+# ---- the window belongs to the athlete, not the server -------------------
+
+def test_the_window_is_read_in_the_athletes_timezone(monkeypatch):
+    """The VM runs on UTC. A naive now() made the window 07:00-13:00 Budapest in
+    summer, so a 06:00 riser waited an hour for a brief that was already ready.
+    """
+    from garmin_mcp.brief import local_now
+    monkeypatch.setenv("BRIEF_TZ", "Europe/Budapest")
+    assert local_now().utcoffset() is not None, "the time must carry a zone"
+    monkeypatch.setenv("BRIEF_TZ", "UTC")
+    assert local_now().utcoffset() == dt.timedelta(0)
+
+
+def test_an_early_riser_is_inside_the_window():
+    """03:30 UTC is 05:30 in Budapest in summer — inside, not outside."""
+    utc = dt.datetime(2026, 7, 1, 3, 30, tzinfo=dt.timezone.utc)
+    assert not in_send_window(utc), "the raw UTC hour is outside"
+    budapest = utc.astimezone(dt.timezone(dt.timedelta(hours=2)))
+    assert in_send_window(budapest), "the same instant in his own morning is inside"
+
+
+def test_an_unknown_timezone_does_not_crash(monkeypatch):
+    from garmin_mcp.brief import local_now
+    monkeypatch.setenv("BRIEF_TZ", "Mars/Olympus_Mons")
+    assert isinstance(local_now(), dt.datetime)
