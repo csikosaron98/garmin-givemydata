@@ -88,3 +88,41 @@ live here.
 The DuckDNS hostname registration is a one-off in Áron's own DuckDNS account, and the
 Garmin credentials live in a gitignored `.env` on the VM. Neither is here and neither
 will be — see the FitBodAI repo's `docs/integration-credentials.md` for the rule.
+
+## Morning training brief
+
+`garmin_mcp.brief` sends one email a morning, from this machine. The timer fires
+every 15 minutes and the module decides whether to send: only between 05:00 and
+11:00 local, only once a day (a `.brief-sent` marker beside the database), and
+only once the night's sleep and readiness rows actually exist. That is what makes
+it an "after waking" email rather than a clock-based one — `training_readiness`
+holds the day's most recent snapshot, so an evening send would read a
+post-session score and print it as a waking value.
+
+```bash
+sudo cp deploy/systemd/garmin-brief.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now garmin-brief.timer
+```
+
+Mail settings go in `.env`, which is git-ignored. **Set these by hand** — a Gmail
+app password, not the account password:
+
+```
+BRIEF_TO=you@example.com
+BRIEF_SMTP_USER=you@example.com
+BRIEF_SMTP_PASSWORD=...
+```
+
+`BRIEF_SMTP_HOST` (default `smtp.gmail.com`) and `BRIEF_SMTP_PORT` (default 587,
+STARTTLS) only need setting for a different provider.
+
+Check it without sending anything:
+
+```bash
+./venv/bin/python -m garmin_mcp.brief --dry-run
+```
+
+`--force` ignores the time window and the once-a-day marker; `--date YYYY-MM-DD`
+builds an older day. A run that finds no sleep or readiness logs that it is
+waiting and exits 0 — the next quarter-hour tries again.

@@ -1,0 +1,13 @@
+[Unit]
+Description=garmin-givemydata morning training brief
+# The brief reads what the sync wrote, so it is pointless without it.
+After=garmin-sync.service
+
+[Service]
+Type=oneshot
+User=opc
+WorkingDirectory=/home/opc/garmin-givemydata
+# Sends only inside its own morning window, and only once a day — the timer
+# fires every 15 minutes so that "after waking" means when the night's data
+# actually landed, not when a clock said it should have.
+ExecStart=/home/opc/garmin-givemydata/venv/bin/python -m garmin_mcp.brief

@@ -1,0 +1,11 @@
+[Unit]
+Description=Check every 15 minutes whether the morning brief can be sent
+
+[Timer]
+OnBootSec=7min
+OnUnitActiveSec=15min
+# Catches up after the VM has been down; the once-a-day marker stops a flood.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
