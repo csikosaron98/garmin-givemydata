@@ -79,16 +79,22 @@ def load_env(project_dir: Path | None = None) -> None:
             os.environ.setdefault(key.strip(), value.strip())
 
 
+# One mapping, used both to READ the settings and to NAME them when they are
+# missing. Spelling these twice sent the first run looking for BRIEF_PASSWORD,
+# a variable nothing reads — an error message that misdirects is worse than none.
+ENV_KEYS = {
+    "to": "BRIEF_TO",
+    "user": "BRIEF_SMTP_USER",
+    "password": "BRIEF_SMTP_PASSWORD",
+}
+
+
 def smtp_config() -> dict:
-    """The mail settings. Reports WHICH key is missing, never its value."""
-    cfg = {
-        "to": os.environ.get("BRIEF_TO", ""),
-        "user": os.environ.get("BRIEF_SMTP_USER", ""),
-        "password": os.environ.get("BRIEF_SMTP_PASSWORD", ""),
-        "host": os.environ.get("BRIEF_SMTP_HOST", "smtp.gmail.com"),
-        "port": int(os.environ.get("BRIEF_SMTP_PORT", "587")),
-    }
-    cfg["missing"] = [k for k in ("to", "user", "password") if not cfg[k]]
+    """The mail settings. Reports WHICH variable is missing, never its value."""
+    cfg = {key: os.environ.get(env, "") for key, env in ENV_KEYS.items()}
+    cfg["host"] = os.environ.get("BRIEF_SMTP_HOST", "smtp.gmail.com")
+    cfg["port"] = int(os.environ.get("BRIEF_SMTP_PORT", "587"))
+    cfg["missing"] = [env for key, env in ENV_KEYS.items() if not cfg[key]]
     return cfg
 
 
@@ -513,7 +519,7 @@ def main(argv=None) -> int:
     cfg = smtp_config()
     if cfg["missing"]:
         log.error("mail is not configured: %s missing from .env",
-                  ", ".join("BRIEF_" + k.upper() for k in cfg["missing"]))
+                  ", ".join(cfg["missing"]))
         return 1
 
     send_email(cfg, subject, text, html)

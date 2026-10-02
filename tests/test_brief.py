@@ -192,7 +192,25 @@ def test_missing_mail_settings_are_named_without_leaking_values(monkeypatch):
     for k in ("BRIEF_TO", "BRIEF_SMTP_USER", "BRIEF_SMTP_PASSWORD"):
         monkeypatch.delenv(k, raising=False)
     cfg = smtp_config()
-    assert set(cfg["missing"]) == {"to", "user", "password"}
+    assert set(cfg["missing"]) == {"BRIEF_TO", "BRIEF_SMTP_USER", "BRIEF_SMTP_PASSWORD"}
+
+
+def test_a_missing_setting_is_named_as_the_variable_that_is_actually_read(monkeypatch):
+    """The first live run reported BRIEF_PASSWORD, which nothing reads.
+
+    An error message that sends you to add the wrong variable is worse than no
+    message, so the names reported and the names looked up come from one map.
+    """
+    from garmin_mcp.brief import ENV_KEYS
+    for env in ENV_KEYS.values():
+        monkeypatch.delenv(env, raising=False)
+    reported = set(smtp_config()["missing"])
+    assert reported == set(ENV_KEYS.values())
+    for env in reported:
+        monkeypatch.setenv(env, "x")
+        assert env not in smtp_config()["missing"], (
+            f"{env} was reported missing, but setting it changes nothing - "
+            "the message names a variable the code does not read")
 
 
 def test_a_configured_password_is_never_put_in_the_missing_report(monkeypatch):
