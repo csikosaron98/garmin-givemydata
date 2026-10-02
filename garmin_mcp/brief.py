@@ -38,6 +38,7 @@ from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
+from . import week as _week
 from .db import DB_PATH, get_connection
 
 log = logging.getLogger(__name__)
@@ -312,7 +313,7 @@ def fmt_hm(hours: float | None) -> str:
     return f"{total // 60}:{total % 60:02d}"
 
 
-def render_text(day: dict, decision: dict, rhr_mean, sessions: list[dict]) -> str:
+def render_text(day: dict, decision: dict, rhr_mean, sessions: list[dict], wk: dict | None = None) -> str:
     headline, body = PRESCRIPTIONS[decision["level"]]
     lines = [f"TODAY — {headline}", "", body, ""]
     if decision["limiter"]:
@@ -329,6 +330,18 @@ def render_text(day: dict, decision: dict, rhr_mean, sessions: list[dict]) -> st
             load = s.get("training_load")
             lines.append(f"{s['d']}  {s['activity_type']}  {mins:.0f} min{dist}"
                          + (f", load {load:.0f}" if load else ""))
+        lines.append("")
+
+    if wk:
+        c = wk["counts"]
+        lines.append("THIS WEEK")
+        lines.append(f"{wk['sessions']} sessions over {wk['days']} days, "
+                     f"{wk['total_minutes']} min")
+        lines.append(f"  aerobic base {c['aerobic_base']} · quality {c['aerobic_quality']}"
+                     f" · strength {c['strength']} · mixed {c['mixed']}"
+                     f" · restorative {c['restorative']}")
+        for note in _week.observations(wk):
+            lines.append(f"  - {note}")
         lines.append("")
 
     lines.append("LAST NIGHT")
@@ -354,7 +367,7 @@ def _row(label: str, value: str) -> str:
             f'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">{value}</td></tr>')
 
 
-def render_html(day: dict, decision: dict, rhr_mean, sessions: list[dict], date: str) -> str:
+def render_html(day: dict, decision: dict, rhr_mean, sessions: list[dict], date: str, wk: dict | None = None) -> str:
     """Table layout and inline styles only — mail clients strip <style> blocks
     and support neither flex nor grid. Palette matches the dashboard so the two
     read as one system.
@@ -389,6 +402,29 @@ def render_html(day: dict, decision: dict, rhr_mean, sessions: list[dict], date:
             bits += f" &middot; load {s['training_load']:.0f}"
         session_rows += _row(f"{s['d']} {s['activity_type'].replace('_',' ')}", bits)
 
+    week_html = ""
+    if wk:
+        c = wk["counts"]
+        chips = [("Aerobic base", c["aerobic_base"]), ("Quality", c["aerobic_quality"]),
+                 ("Strength", c["strength"]), ("Mixed", c["mixed"]),
+                 ("Restorative", c["restorative"])]
+        chip_html = "".join(
+            f'<td style="padding:0 16px 0 0;"><div style="font-size:10px;color:#6b6a5e;'
+            f'text-transform:uppercase;letter-spacing:.05em;">{label}</div>'
+            f'<div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;'
+            f'font-size:19px;font-weight:600;color:{"#20241f" if n else "#9a998b"};">{n}</div></td>'
+            for label, n in chips)
+        notes = "".join(
+            f'<div style="font-size:12.5px;color:#20241f;line-height:1.5;padding-top:7px;">'
+            f'&middot; {o}</div>' for o in _week.observations(wk))
+        week_html = (
+            '<tr><td style="padding:22px 28px 0;">'
+            '<div style="font-size:11px;letter-spacing:.07em;text-transform:uppercase;'
+            'color:#6b6a5e;font-weight:700;padding-bottom:8px;">This week &middot; '
+            f'{wk["sessions"]} sessions, {wk["total_minutes"]} min</div>'
+            f'<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>{chip_html}</tr></table>'
+            f'{notes}</td></tr>')
+
     notes_html = ""
     if decision["notes"]:
         notes_html = ('<tr><td style="padding:18px 28px 24px;">'
@@ -415,6 +451,7 @@ def render_html(day: dict, decision: dict, rhr_mean, sessions: list[dict], date:
 <div style="font-size:11px;letter-spacing:.07em;text-transform:uppercase;color:#6b6a5e;font-weight:700;padding-bottom:6px;">Last night</div>
 <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="font-size:13.5px;color:#20241f;">{''.join(rows)}</table>
 </td></tr>
+{week_html}
 {notes_html}
 <tr><td style="padding:0 28px 26px;">
 <div style="border-top:1px solid #e2ded1;padding-top:14px;font-size:11.5px;color:#9a998b;line-height:1.55;">
@@ -488,11 +525,18 @@ def build(conn: sqlite3.Connection, date: str) -> tuple[str, str, str] | None:
     rhr_mean = rhr_baseline(conn, date)
     sessions = recent_sessions(conn, date)
     decision = decide(day, rhr_mean, sessions)
+    # The week so far, so the brief can say what is still MISSING rather than
+    # only what today's readiness allows. A broken tally must not cost the brief.
+    try:
+        wk = _week.summarize(conn, date)
+    except Exception as exc:
+        log.warning("could not summarise the week: %s", exc)
+        wk = None
     pretty = _dt.date.fromisoformat(date).strftime("%A %-d %B")
     return (
         f"Training brief — {pretty}",
-        render_text(day, decision, rhr_mean, sessions),
-        render_html(day, decision, rhr_mean, sessions, date),
+        render_text(day, decision, rhr_mean, sessions, wk),
+        render_html(day, decision, rhr_mean, sessions, date, wk),
     )
 
 
