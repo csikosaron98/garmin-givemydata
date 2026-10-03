@@ -365,3 +365,68 @@ def test_a_broken_goal_table_costs_the_brief_nothing_but_the_goal(db):
     built = build(db, "2026-10-02")
     assert built is not None, "the brief must still go out"
     assert "TODAY" in built[1]
+
+
+def test_the_week_s_remainder_reaches_both_halves_of_the_email(db):
+    """The whole point of the feature is that the morning email says it. Mutation
+    found this missing: deleting the line from the plain-text half broke no test
+    at all, because every assertion lived one layer down in goals.py."""
+    from garmin_mcp.goals import Goal, add_goal
+
+    _seed(db, "2026-10-02")
+    add_goal(db, Goal(kind="race", name="Wien Hyrox", discipline="hyrox",
+                      race_date="2027-02-20", priority=1))
+    # A thin week against a base-phase target: something is certainly owed.
+    _add_activity(db, "2026-09-28", "11:00", "strength_training", 70, load=12)
+    subject, text, html = build(db, "2026-10-02")
+    for half, body in (("text", text), ("html", html)):
+        assert "the week still owes" in body, f"the focus line is missing from the {half} half"
+
+
+def test_the_two_halves_say_the_same_thing_about_today(db):
+    """They each call the advice themselves, which is one edit away from the two
+    describing the same morning differently."""
+    from garmin_mcp.goals import Goal, add_goal
+
+    _seed(db, "2026-10-02")
+    add_goal(db, Goal(kind="race", name="Wien Hyrox", discipline="hyrox",
+                      race_date="2027-02-20", priority=1))
+    _add_activity(db, "2026-09-28", "11:00", "strength_training", 70, load=12)
+    subject, text, html = build(db, "2026-10-02")
+    from garmin_mcp.brief import decide, read_day, recent_sessions, rhr_baseline, todays_focus_line
+    from garmin_mcp.week import summarize
+
+    day = read_day(db, "2026-10-02")
+    line = todays_focus_line(
+        decide(day, rhr_baseline(db, "2026-10-02"), recent_sessions(db, "2026-10-02")),
+        summarize(db, "2026-10-02"),
+        Goal(kind="race", name="Wien Hyrox", discipline="hyrox",
+             race_date="2027-02-20", priority=1),
+        "2026-10-02")
+    assert line and line in text and line in html
+
+
+def test_a_rest_day_email_does_not_ask_for_the_week_s_work(db):
+    """The ceiling comes first, and the email has to read that way too."""
+    from garmin_mcp.goals import Goal, add_goal
+
+    # Short sleep alone only lowers the ceiling a step; it takes a poor readiness
+    # with it to reach a rest day, which is the case worth testing here.
+    _seed(db, "2026-10-02", sleep_time_seconds=3 * 3600, readiness=10)
+    add_goal(db, Goal(kind="race", name="Wien Hyrox", discipline="hyrox",
+                      race_date="2027-02-20", priority=1))
+    subject, text, html = build(db, "2026-10-02")
+    assert "Rest day" in text
+    assert "not today" in text, "it names what waits rather than silently dropping it"
+    assert "fits today" not in text, "and asks for nothing"
+
+
+def test_the_prescriptions_name_no_sport(db):
+    """They describe the intensity the day allows; WHICH session comes from the
+    week's remainder. Naming a sport here contradicted that line directly."""
+    from garmin_mcp.brief import PRESCRIPTIONS
+
+    for level, (headline, body) in PRESCRIPTIONS.items():
+        joined = (headline + " " + body).lower()
+        for sport in ("running", "run.", "a run", "cycling", "swim", "gym"):
+            assert sport not in joined, f"{level} prescribes a sport: {headline}"
