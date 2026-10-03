@@ -430,3 +430,30 @@ def test_the_prescriptions_name_no_sport(db):
         joined = (headline + " " + body).lower()
         for sport in ("running", "run.", "a run", "cycling", "swim", "gym"):
             assert sport not in joined, f"{level} prescribes a sport: {headline}"
+
+
+def test_the_note_s_effect_is_explained_in_the_email(db):
+    """Reading "1 of 3" without knowing the 3 came from "doubles" is reading a
+    number out of nowhere."""
+    from garmin_mcp.goals import Goal, add_goal
+
+    _seed(db, "2026-10-02")
+    add_goal(db, Goal(kind="race", name="Hyrox BP", discipline="hyrox",
+                      race_date="2026-12-19", priority=1,
+                      notes="Doubles, Levivel"))
+    _add_activity(db, "2026-09-28", "11:00", "strength_training", 70, load=12)
+    subject, text, html = build(db, "2026-10-02")
+    for half, body in (("text", text), ("html", html)):
+        assert "From your note" in body, f"missing from the {half} half"
+        assert "doubles" in body, f"the marker is not named in the {half} half"
+        assert "8 km" in body, f"and the reason is missing from the {half} half"
+
+
+def test_an_unrecognised_note_is_reported_rather_than_ignored(db):
+    from garmin_mcp.goals import Goal, add_goal
+
+    _seed(db, "2026-10-02")
+    add_goal(db, Goal(kind="race", name="Wien Hyrox", discipline="hyrox",
+                      race_date="2027-02-20", priority=1, notes="Szóló, Bécs"))
+    subject, text, html = build(db, "2026-10-02")
+    assert "Nothing in the note changes the targets" in text

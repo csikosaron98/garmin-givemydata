@@ -664,3 +664,149 @@ def test_an_unknown_level_returns_nothing_rather_than_guessing(db):
                    "2026-11-04")
     out = todays_focus("extremely hard", summarize(db, "2026-11-04"), t, "2026-11-04")
     assert out["focus"] is None and out["line"] == ""
+
+
+# ---- the half Ironman ------------------------------------------------------
+
+def test_the_half_ironman_is_its_own_discipline():
+    """Not "other", and not the full distance: the same framework with shorter
+    long sessions. Áron named it, so it has to exist as itself."""
+    assert "half_ironman" in RACE_DISCIPLINES
+    table = RACE_TARGETS["half_ironman"]
+    for phase in (PHASE_BASE, PHASE_BUILD, PHASE_PEAK, PHASE_TAPER, PHASE_RACE):
+        assert phase in table
+        assert table[phase].source, f"{phase} has no stated source"
+
+
+def test_the_half_ironman_asks_for_less_than_the_full_one():
+    """Otherwise the distinction is decorative."""
+    for phase in (PHASE_BASE, PHASE_BUILD, PHASE_PEAK):
+        half = RACE_TARGETS["half_ironman"][phase]
+        full = RACE_TARGETS["ironman"][phase]
+        assert half.long_minutes < full.long_minutes, (
+            f"the 70.3 {phase} long session is not shorter than the full distance's")
+
+
+def test_the_half_ironman_long_session_grows_through_the_block():
+    t = RACE_TARGETS["half_ironman"]
+    assert (t[PHASE_BASE].long_minutes < t[PHASE_BUILD].long_minutes
+            < t[PHASE_PEAK].long_minutes), "the long ride is what the block builds"
+    assert t[PHASE_TAPER].long_minutes < t[PHASE_PEAK].long_minutes
+
+
+# ---- what the notes say ----------------------------------------------------
+# Free text, read by recognising a documented vocabulary rather than by
+# interpreting the sentence: the morning email runs on a server with no model in
+# it, so anything the page could interpret the email could not.
+
+from garmin_mcp.goals import (  # noqa: E402
+    NOTE_MARKERS,
+    WeeklyTarget,
+    apply_notes,
+    read_notes,
+    unread_note,
+)
+
+
+def _race(notes, discipline="hyrox"):
+    return Goal(kind="race", name="R", discipline=discipline,
+                race_date="2027-01-01", notes=notes)
+
+
+def test_doubles_is_read_from_a_sentence_in_hungarian(db):
+    """Áron's real note. Whole-word matching, so it is found inside a sentence."""
+    r = read_notes(_race("Doubles, Levivel — mint Rómában (66:30)"))
+    assert r["found"] == ["doubles"]
+    assert r["effect"] == {"base": 1}
+    assert r["why"] and "8 km" in r["why"][0], "it says why, not just what"
+
+
+def test_doubles_moves_the_target_it_claims_to(db):
+    base_target = RACE_TARGETS["hyrox"][PHASE_BUILD]
+    moved, _ = apply_notes(base_target, _race("doubles"))
+    assert moved.base == base_target.base + 1
+    assert moved.sessions == base_target.sessions, (
+        "a note changes the MIX of a week, not how much of it there is")
+
+
+def test_the_pro_category_moves_the_strength_side(db):
+    base_target = RACE_TARGETS["hyrox"][PHASE_BUILD]
+    moved, _ = apply_notes(base_target, _race("Pro category"))
+    assert moved.strength == base_target.strength + 1
+    assert read_notes(_race("elite"))["found"] == ["pro category"], "elite means pro"
+
+
+def test_the_standard_markers_change_nothing(db):
+    """Open and singles are what the targets already assume. They are recognised
+    so the page can say it read them, not because they move anything."""
+    base_target = RACE_TARGETS["hyrox"][PHASE_BUILD]
+    for note in ("open", "singles"):
+        moved, r = apply_notes(base_target, _race(note))
+        assert r["found"], f"{note} is recognised"
+        assert moved == base_target, f"{note} moves nothing"
+
+
+def test_a_contradictory_note_applies_neither(db):
+    """"Pro kategória, open nem" names both. Adding the effects would be nonsense
+    and picking one would be a guess."""
+    r = read_notes(_race("Pro kategória, open nem"))
+    assert r["found"] == [] and r["effect"] == {}
+    assert len(r["conflicts"]) == 1 and "category" in r["conflicts"][0]
+    assert "contradicts itself" in unread_note(_race("Pro kategória, open nem"))
+
+
+def test_two_markers_from_different_groups_both_apply(db):
+    r = read_notes(_race("doubles, pro"))
+    assert set(r["found"]) == {"doubles", "pro category"}
+    assert r["effect"] == {"base": 1, "strength": 1}
+
+
+def test_a_marker_for_another_discipline_is_ignored(db):
+    """"Doubles" means nothing in a running race, and reading it there would move
+    a target for no reason."""
+    assert read_notes(_race("doubles", discipline="running"))["found"] == []
+
+
+def test_a_note_the_rules_do_not_know_says_so(db):
+    """A note that looks acted upon and is not is worse than one plainly skipped."""
+    said = unread_note(_race("Szóló, Bécs"))
+    assert "Nothing in the note changes the targets" in said
+    assert "doubles" in said, "and it lists what would have worked"
+
+
+def test_an_empty_note_says_nothing_at_all(db):
+    assert unread_note(_race(None)) == ""
+    assert unread_note(_race("")) == ""
+    assert read_notes(None)["found"] == []
+
+
+def test_a_marker_inside_a_longer_word_is_not_a_marker(db):
+    """Whole words only, or "openly" would set the category."""
+    assert read_notes(_race("openly competitive"))["found"] == []
+
+
+def test_the_notes_reach_the_target_everyone_uses(db):
+    """Applied inside target_for, so the page, the email and the plan all see the
+    adjusted target without having to remember to ask for it."""
+    gid = add_goal(db, Goal(kind="race", name="Hyrox BP", discipline="hyrox",
+                            race_date="2027-01-01", priority=1,
+                            notes="Doubles, Levivel"))
+    goal = [g for g in all_goals(db) if g.goal_id == gid][0]
+    adjusted, phase = target_for(goal, "2026-10-03")
+    plain = RACE_TARGETS["hyrox"][phase]
+    assert adjusted.base == plain.base + 1
+
+
+def test_a_floor_is_never_pushed_below_zero(db):
+    """A relay lowers the aerobic side, and a target with -1 base sessions in it
+    would make every gap calculation nonsense."""
+    t = WeeklyTarget(3, base=0, quality=1, strength=1, long_minutes=0)
+    moved, _ = apply_notes(t, _race("relay"))
+    assert moved.base == 0
+
+
+def test_every_marker_declares_a_group_and_a_reason():
+    for marker, spec in NOTE_MARKERS.items():
+        assert spec["group"], f"{marker} has no group, so it can contradict nothing"
+        assert spec["why"], f"{marker} changes a target without saying why"
+        assert spec["disciplines"], f"{marker} applies to no discipline"

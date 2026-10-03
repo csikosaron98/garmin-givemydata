@@ -27,6 +27,7 @@ Nothing here is medical advice, and nothing here prescribes food.
 from __future__ import annotations
 
 import datetime as _dt
+import re as _re
 import sqlite3
 from dataclasses import dataclass, field
 
@@ -34,7 +35,7 @@ from dataclasses import dataclass, field
 # the vocabulary
 # ---------------------------------------------------------------------------
 
-RACE_DISCIPLINES = ("hyrox", "running", "ironman", "other")
+RACE_DISCIPLINES = ("hyrox", "running", "half_ironman", "ironman", "other")
 STANDING_KINDS = ("maintenance", "strength", "muscle", "fat_loss")
 
 STANDING_LABELS = {
@@ -47,6 +48,7 @@ STANDING_LABELS = {
 DISCIPLINE_LABELS = {
     "hyrox": "HYROX",
     "running": "Running race",
+    "half_ironman": "Half Ironman (70.3)",
     "ironman": "Ironman",
     "other": "Race",
 }
@@ -158,6 +160,32 @@ RACE_TARGETS: dict[str, dict[str, WeeklyTarget]] = {
         PHASE_RACE: WeeklyTarget(3, max_sessions=3, base=2, quality=1, strength=0, long_minutes=0,
                                  focus="Easy, short, and off your feet otherwise",
                                  source="80/20 polarised distribution"),
+    },
+    # 70.3 is the same framework as the full distance with shorter long sessions.
+    # The published plans run six to nine sessions a week — one or two swims, two
+    # or three rides, three runs — so six is the lean end of it, and the long ride
+    # is the session the distance is actually built on.
+    "half_ironman": {
+        PHASE_BASE: WeeklyTarget(6, base=4, quality=1, strength=1, long_minutes=120,
+                                 focus="Aerobic volume across all three disciplines",
+                                 source="70.3 plans: 6-9 sessions a week (1-2 swims, 2-3 rides, "
+                                        "3 runs), the long ride building through the block"),
+        PHASE_BUILD: WeeklyTarget(6, base=4, quality=2, strength=1, long_minutes=150,
+                                  focus="The long ride, and a run off the bike every week",
+                                  source="70.3 plans: a structured bike session for sustainable "
+                                         "power, and a short run off the bike for durability"),
+        PHASE_PEAK: WeeklyTarget(6, base=4, quality=2, strength=1, long_minutes=180,
+                                 focus="The long ride at 3 hours, race nutrition rehearsed on it",
+                                 source="70.3 plans: long rides progressing to 3-4 h at "
+                                        "controlled aerobic effort"),
+        PHASE_TAPER: WeeklyTarget(4, max_sessions=4, base=3, quality=1, strength=1,
+                                  long_minutes=75,
+                                  focus="Volume down, the intensity kept short and sharp",
+                                  source="70.3 plans: two weeks of coming down"),
+        PHASE_RACE: WeeklyTarget(3, max_sessions=3, base=2, quality=1, strength=0,
+                                 long_minutes=0,
+                                 focus="Openers only — short, with a few race-pace minutes",
+                                 source="70.3 plans: race week is openers"),
     },
     # Three disciplines in six sessions is already a compromise, and the advice
     # says so rather than pretending the week is sufficient.
@@ -422,7 +450,11 @@ def target_for(goal: Goal | None, date: str) -> tuple[WeeklyTarget, str | None]:
     if goal.kind == "race" and goal.race_date:
         phase = phase_for(goal.race_date, date)
         table = RACE_TARGETS.get(goal.discipline or "other", RACE_TARGETS["other"])
-        return table[phase], phase
+        # Applied here rather than at each call site, so the page, the email and
+        # the plan all see the same adjusted target without having to remember to
+        # ask for it.
+        adjusted, _notes = apply_notes(table[phase], goal)
+        return adjusted, phase
     return STANDING_TARGETS.get(goal.standing or "", DEFAULT_TARGET), None
 
 
@@ -469,6 +501,160 @@ def gaps(summary: dict, target: WeeklyTarget) -> list[Gap]:
 
 def met(summary: dict, target: WeeklyTarget) -> bool:
     return not gaps(summary, target)
+
+
+# ---------------------------------------------------------------------------
+# what the notes say
+# ---------------------------------------------------------------------------
+# A goal's `notes` is free text, and the format of a race lives there: open or
+# pro category, doubles or singles, a relay leg. Those genuinely change what a
+# week should contain, so the advice reads them.
+#
+# It reads them by RECOGNISING a small documented vocabulary, not by
+# interpreting the sentence. Two reasons. The morning email runs on a server with
+# no model in it, so anything the page could interpret the email could not — and
+# the two describing the same goal differently is the thing this module exists to
+# prevent. And a rule that can be stated can be checked; "the computer read your
+# note and decided" cannot.
+#
+# What it does NOT recognise, it says so, rather than leaving a note silently
+# ignored. That matters more than the recognising: a note that looks acted upon
+# and is not is worse than one plainly skipped.
+
+# marker -> (which disciplines it applies to, what it changes, why)
+NOTE_MARKERS = {
+    "doubles": {
+        "disciplines": ("hyrox",),
+        "group": "format",
+        "label": "doubles",
+        "effect": {"base": +1},
+        "why": "In doubles the station reps are shared but both athletes run the "
+               "whole 8 km, so the running is a larger share of your race than in "
+               "singles — one more aerobic session, one less station-dominated one.",
+    },
+    "singles": {
+        "disciplines": ("hyrox",),
+        "group": "format",
+        "label": "singles",
+        "effect": {},
+        "why": "Singles: the standard split of running and stations, which the "
+               "targets already assume.",
+    },
+    "relay": {
+        "disciplines": ("hyrox",),
+        "group": "format",
+        "label": "relay",
+        "effect": {"base": -1},
+        "why": "A relay leg is a fraction of the race, so the aerobic demand is "
+               "lower than a full one.",
+    },
+    "pro": {
+        "disciplines": ("hyrox",),
+        "group": "category",
+        "label": "pro category",
+        "effect": {"strength": +1},
+        "why": "The pro category carries heavier implements throughout, so the "
+               "strength side needs more of the week than open does.",
+    },
+    "elite": {
+        "disciplines": ("hyrox",),
+        "group": "category",
+        "label": "pro category",
+        "effect": {"strength": +1},
+        "why": "The elite/pro category carries heavier implements throughout, so "
+               "the strength side needs more of the week than open does.",
+    },
+    "open": {
+        "disciplines": ("hyrox",),
+        "group": "category",
+        "label": "open category",
+        "effect": {},
+        "why": "Open category: the standard weights, which the targets assume.",
+    },
+}
+
+
+def read_notes(goal: Goal | None) -> dict:
+    """Which markers the notes carry, and what they change.
+
+    Matched on whole words, case-insensitively, so "Doubles, Levivel" is read and
+    a word that merely contains a marker is not.
+    """
+    out = {"found": [], "effect": {}, "why": [], "conflicts": [],
+           "text": (goal.notes if goal else None)}
+    if not goal or not goal.notes:
+        return out
+    text = goal.notes.lower()
+    discipline = goal.discipline or ""
+    by_group: dict[str, list[dict]] = {}
+    for marker, spec in NOTE_MARKERS.items():
+        if discipline not in spec["disciplines"]:
+            continue
+        if not _re.search(r"(?<![\w])" + _re.escape(marker) + r"(?![\w])", text):
+            continue
+        hits = by_group.setdefault(spec["group"], [])
+        if any(h["label"] == spec["label"] for h in hits):
+            continue                      # pro and elite mean the same thing
+        hits.append(spec)
+
+    for group, hits in sorted(by_group.items()):
+        if len(hits) > 1:
+            # "Pro kategória, open nem" names both. Adding their effects would be
+            # nonsense and picking one would be a guess, so neither is applied and
+            # the contradiction is reported — it is the note that needs fixing.
+            out["conflicts"].append(
+                group + ": the note names " +
+                " and ".join(sorted(h["label"] for h in hits)) +
+                ", so neither is applied")
+            continue
+        spec = hits[0]
+        out["found"].append(spec["label"])
+        for field, delta in spec["effect"].items():
+            out["effect"][field] = out["effect"].get(field, 0) + delta
+        out["why"].append(spec["why"])
+    return out
+
+
+def apply_notes(target: WeeklyTarget, goal: Goal | None) -> tuple[WeeklyTarget, dict]:
+    """The target as the notes modify it, and what was read to get there.
+
+    A floor is never pushed below zero, and the session total is left alone: a
+    note changes the MIX of a week, not how much of it there is.
+    """
+    notes = read_notes(goal)
+    if not notes["effect"]:
+        return target, notes
+    fields = {"base": target.base, "quality": target.quality,
+              "strength": target.strength}
+    for field, delta in notes["effect"].items():
+        if field in fields:
+            fields[field] = max(0, fields[field] + delta)
+    return (WeeklyTarget(
+        sessions=target.sessions, base=fields["base"], quality=fields["quality"],
+        strength=fields["strength"], long_minutes=target.long_minutes,
+        max_hard=target.max_hard, max_sessions=target.max_sessions,
+        separation_hours=target.separation_hours, focus=target.focus,
+        source=target.source), notes)
+
+
+def unread_note(goal: Goal | None) -> str:
+    """Said out loud when a note carries nothing the rules know.
+
+    A note that looks acted upon and is not is worse than one plainly skipped.
+    """
+    notes = read_notes(goal)
+    if notes["conflicts"]:
+        return "The note contradicts itself — " + "; ".join(notes["conflicts"]) + "."
+    if not goal or not goal.notes or notes["found"]:
+        return ""
+    known = ", ".join(sorted({v["label"] for v in NOTE_MARKERS.values()
+                              if (goal.discipline or "") in v["disciplines"]}))
+    if not known:
+        return (f"The note on this goal is kept as it is written, and nothing in it "
+                f"changes the targets — no marker is defined for a "
+                f"{DISCIPLINE_LABELS.get(goal.discipline or 'other', 'race').lower()}.")
+    return (f"Nothing in the note changes the targets. For this race the rules "
+            f"recognise: {known}.")
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +816,17 @@ def observations(summary: dict, goal: Goal | None, date: str) -> list[str]:
     out: list[str] = [describe_goal(goal, date)]
     if target.focus:
         out.append(f"This week is for: {target.focus}.")
+
+    # What the note changed, and why. Printed BEFORE the gaps, because it changed
+    # the numbers those gaps are measured against — reading "1 of 3" without
+    # knowing the 3 came from "doubles" is reading a number out of nowhere.
+    notes = read_notes(goal)
+    if notes["found"]:
+        out.append("From your note (" + ", ".join(notes["found"]) + "): " +
+                   " ".join(notes["why"]))
+    skipped = unread_note(goal)
+    if skipped:
+        out.append(skipped)
 
     shortfalls = gaps(summary, target)
     if not shortfalls:
