@@ -3009,6 +3009,146 @@ def garmin_wellness_activity(days: int = 30) -> str:
 
 
 # ---------------------------------------------------------------------------
+# garmin_goals / garmin_goal_write
+# ---------------------------------------------------------------------------
+# The ONE writable tool on this server, and the only reason it exists is that the
+# published dashboard has to be able to set what Áron is training for. Everything
+# about it is deliberately narrow:
+#
+#   * it writes one table, `training_goal`, which holds nothing Garmin collected —
+#     losing all of it costs a retyped goal, not a day of history;
+#   * it takes no SQL. The fields are named parameters, and every one of them goes
+#     through garmin_mcp.goals, which is the same validator the terminal CLI uses.
+#     One validator means the page cannot store a goal the terminal would refuse,
+#     and vice versa;
+#   * it cannot reach any other table, and it cannot change the schema.
+#
+# Everything else on this server stays read-only at the SQLite engine level.
+
+
+@mcp.tool()
+def garmin_training_goals() -> str:
+    """List the athlete's training goals and what this week is judged against.
+
+    NOT `garmin_goals` — that name is already taken by Garmin's own goals table
+    (step and intensity targets synced from Connect). These are Áron's races and
+    standing objectives, which Garmin knows nothing about.
+
+    Read-only. The dashboard can also read the `training_goal` table through
+    `garmin_query`; this tool additionally returns the derived target, so the page
+    and the morning email cannot compute it differently.
+    """
+    from . import goals as _goals
+
+    conn = get_connection()
+    try:
+        today = date.today().isoformat()
+        all_of_them = _goals.all_goals(conn, include_retired=True)
+        driving = _goals.driving_goal(conn, today)
+        target, phase = _goals.target_for(driving, today)
+        return json.dumps(
+            {
+                "date": today,
+                "goals": [
+                    {
+                        "goal_id": g.goal_id, "kind": g.kind, "name": g.name,
+                        "discipline": g.discipline, "standing": g.standing,
+                        "race_date": g.race_date, "target": g.target,
+                        "priority": g.priority, "active": g.active,
+                        "created": g.created, "notes": g.notes,
+                        "label": g.label,
+                        "weeks_until": (_goals.weeks_until(g.race_date, today)
+                                        if g.race_date else None),
+                        "phase": (_goals.phase_for(g.race_date, today)
+                                  if g.kind == "race" and g.race_date else None),
+                    }
+                    for g in all_of_them
+                ],
+                "driving_goal_id": driving.goal_id if driving else None,
+                "phase": phase,
+                "describe": _goals.describe_goal(driving, today),
+                "target": {
+                    "sessions": target.sessions, "base": target.base,
+                    "quality": target.quality, "strength": target.strength,
+                    "long_minutes": target.long_minutes,
+                    "max_hard": target.max_hard, "max_sessions": target.max_sessions,
+                    "separation_hours": target.separation_hours,
+                    "focus": target.focus, "source": target.source,
+                },
+            },
+            separators=(",", ":"), default=str)
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def garmin_goal_write(
+    action: str,
+    goal_id: int | None = None,
+    kind: str | None = None,
+    name: str | None = None,
+    discipline: str | None = None,
+    standing: str | None = None,
+    race_date: str | None = None,
+    target: str | None = None,
+    priority: int | None = None,
+    notes: str | None = None,
+) -> str:
+    """Add, change or retire ONE training goal. The only write on this server.
+
+    *action* is ``add``, ``update`` or ``retire``.
+
+    ``add`` needs *kind* (``race`` or ``standing``), *name*, and then either
+    *discipline* + *race_date* for a race, or *standing* for a standing goal.
+    ``update`` and ``retire`` need *goal_id*.
+
+    Writes only the `training_goal` table, takes no SQL, and validates through the
+    same code the command line uses. Retiring deactivates rather than deletes.
+    """
+    from . import goals as _goals
+
+    if action not in ("add", "update", "retire"):
+        return json.dumps({"error": "action must be add, update or retire"})
+
+    conn = get_connection()
+    try:
+        if action == "add":
+            new_id = _goals.add_goal(conn, _goals.Goal(
+                kind=kind or "", name=name or "", discipline=discipline,
+                standing=standing, race_date=race_date, target=target,
+                priority=2 if priority is None else priority, notes=notes))
+            log.info("garmin_goal_write add goal_id=%s kind=%s", new_id, kind)
+            return json.dumps({"ok": True, "action": "add", "goal_id": new_id})
+
+        if goal_id is None:
+            return json.dumps({"error": f"{action} needs goal_id"})
+
+        if action == "retire":
+            done = _goals.retire_goal(conn, int(goal_id))
+            log.info("garmin_goal_write retire goal_id=%s found=%s", goal_id, done)
+            return json.dumps({"ok": done, "action": "retire", "goal_id": goal_id}
+                              if done else {"error": f"no goal with id {goal_id}"})
+
+        done = _goals.update_goal(
+            conn, int(goal_id), name=name, target=target, notes=notes,
+            priority=priority, race_date=race_date, discipline=discipline,
+            standing=standing)
+        log.info("garmin_goal_write update goal_id=%s changed=%s", goal_id, done)
+        return json.dumps({"ok": done, "action": "update", "goal_id": goal_id}
+                          if done else {"error": "nothing to change, or no such goal"})
+    except ValueError as exc:
+        # The validator's own message names the field and the allowed values, which
+        # is exactly what the page needs to show. Not logged as an exception: a
+        # rejected goal is the validator working, not a fault.
+        return json.dumps({"error": str(exc)})
+    except Exception:
+        log.exception("garmin_goal_write failed")
+        return json.dumps({"error": "Could not write the goal."})
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
