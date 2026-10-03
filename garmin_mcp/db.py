@@ -806,6 +806,7 @@ CREATE TABLE IF NOT EXISTS training_goal (
     discipline  TEXT,                   -- race: hyrox | running | ironman | other
     standing    TEXT,                   -- maintenance | strength | muscle | fat_loss
     race_date   TEXT,                   -- ISO date, races only
+    category    TEXT,                   -- hyrox: open | pro | doubles | doubles_pro | relay
     target      TEXT,                   -- free text, e.g. '65:00', 'sub-3:30'
     priority    INTEGER NOT NULL DEFAULT 2,   -- 1 = A race, 2 = B, 3 = C
     active      INTEGER NOT NULL DEFAULT 1,
@@ -940,6 +941,17 @@ def migrate_sleep_table(conn: sqlite3.Connection) -> None:
             "avg_skin_temp_deviation_f": "avgSkinTempDeviationF",
         },
     )
+
+
+def migrate_training_goal_table(conn: sqlite3.Connection) -> None:
+    """A race's category, which used to be read out of its free-text notes.
+
+    A HYROX division is structured data — open or pro, singles, doubles or relay
+    — and parsing it out of a sentence meant two paths to one fact that could
+    disagree. Existing rows get NULL, which the targets read as the standard
+    division, so nothing changes for a goal entered before this column existed.
+    """
+    _add_columns(conn, "training_goal", [("category", "TEXT")])
 
 
 def migrate_hrv_table(conn: sqlite3.Connection) -> None:
@@ -1527,6 +1539,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     migrate_training_status_table(conn)
     migrate_activity_splits_table(conn)
     migrate_activity_splits_v2(conn)
+    migrate_training_goal_table(conn)
     migrate_hrv_table(conn)
     migrate_sleep_table(conn)
     migrate_heart_rate_table(conn)

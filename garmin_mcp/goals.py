@@ -281,6 +281,7 @@ class Goal:
     discipline: str | None = None
     standing: str | None = None
     race_date: str | None = None
+    category: str | None = None
     target: str | None = None
     priority: int = 2
     active: bool = True
@@ -298,7 +299,7 @@ def _row_to_goal(row) -> Goal:
     return Goal(
         goal_id=row["goal_id"], kind=row["kind"], name=row["name"],
         discipline=row["discipline"], standing=row["standing"],
-        race_date=row["race_date"], target=row["target"],
+        race_date=row["race_date"], category=row["category"], target=row["target"],
         priority=row["priority"], active=bool(row["active"]),
         created=row["created"], notes=row["notes"])
 
@@ -316,16 +317,21 @@ def add_goal(conn: sqlite3.Connection, goal: Goal) -> int:
         if not goal.race_date:
             raise ValueError("a race needs a date")
         _dt.date.fromisoformat(goal.race_date)      # raises on a bad date
+        if goal.category and goal.category not in categories_for(goal.discipline):
+            offered = sorted(categories_for(goal.discipline)) or ["none"]
+            raise ValueError(
+                f"category must be one of {offered} for a {goal.discipline} race")
     else:
         if goal.standing not in STANDING_KINDS:
             raise ValueError(f"standing must be one of {STANDING_KINDS}")
     created = goal.created or _dt.date.today().isoformat()
     cur = conn.execute(
         "INSERT INTO training_goal (kind, name, discipline, standing, race_date, "
-        "target, priority, active, created, notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "category, target, priority, active, created, notes) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (goal.kind, goal.name.strip(), goal.discipline, goal.standing,
-         goal.race_date, goal.target, goal.priority, 1 if goal.active else 0,
-         created, goal.notes))
+         goal.race_date, goal.category, goal.target, goal.priority,
+         1 if goal.active else 0, created, goal.notes))
     conn.commit()
     return int(cur.lastrowid)
 
@@ -347,7 +353,7 @@ def update_goal(conn: sqlite3.Connection, goal_id: int, **fields) -> bool:
     entered, or the format of it written down.
     """
     allowed = ("name", "target", "notes", "priority", "race_date", "discipline",
-               "standing")
+               "standing", "category")
     bad = sorted(set(fields) - set(allowed))
     if bad:
         raise ValueError(f"cannot set {bad}; only {allowed}")
@@ -360,6 +366,15 @@ def update_goal(conn: sqlite3.Connection, goal_id: int, **fields) -> bool:
         raise ValueError(f"discipline must be one of {RACE_DISCIPLINES}")
     if "standing" in fields and fields["standing"] not in STANDING_KINDS:
         raise ValueError(f"standing must be one of {STANDING_KINDS}")
+    if "category" in fields:
+        # The discipline may be changing in the same call, so the new one decides.
+        row = conn.execute("SELECT discipline FROM training_goal WHERE goal_id = ?",
+                           (goal_id,)).fetchone()
+        discipline = fields.get("discipline") or (row[0] if row else None)
+        if fields["category"] not in categories_for(discipline):
+            offered = sorted(categories_for(discipline)) or ["none"]
+            raise ValueError(
+                f"category must be one of {offered} for a {discipline} race")
     sets = ", ".join(f"{k} = ?" for k in fields)
     cur = conn.execute(f"UPDATE training_goal SET {sets} WHERE goal_id = ?",
                        (*fields.values(), goal_id))
@@ -453,8 +468,7 @@ def target_for(goal: Goal | None, date: str) -> tuple[WeeklyTarget, str | None]:
         # Applied here rather than at each call site, so the page, the email and
         # the plan all see the same adjusted target without having to remember to
         # ask for it.
-        adjusted, _notes = apply_notes(table[phase], goal)
-        return adjusted, phase
+        return apply_category(table[phase], goal), phase
     return STANDING_TARGETS.get(goal.standing or "", DEFAULT_TARGET), None
 
 
@@ -504,157 +518,91 @@ def met(summary: dict, target: WeeklyTarget) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# what the notes say
+# the race's category
 # ---------------------------------------------------------------------------
-# A goal's `notes` is free text, and the format of a race lives there: open or
-# pro category, doubles or singles, a relay leg. Those genuinely change what a
-# week should contain, so the advice reads them.
+# A HYROX division is structured data: open or pro weights, raced as singles,
+# doubles or a relay leg. It changes what a week should contain, so it is a field
+# on the goal rather than something parsed out of free text — one path to one
+# fact, and a dropdown the athlete cannot misspell.
 #
-# It reads them by RECOGNISING a small documented vocabulary, not by
-# interpreting the sentence. Two reasons. The morning email runs on a server with
-# no model in it, so anything the page could interpret the email could not — and
-# the two describing the same goal differently is the thing this module exists to
-# prevent. And a rule that can be stated can be checked; "the computer read your
-# note and decided" cannot.
-#
-# What it does NOT recognise, it says so, rather than leaving a note silently
-# ignored. That matters more than the recognising: a note that looks acted upon
-# and is not is worse than one plainly skipped.
+# Only HYROX defines categories so far. A race whose discipline has none, or a
+# goal with the field unset, gets the discipline's plain targets.
 
-# marker -> (which disciplines it applies to, what it changes, why)
-NOTE_MARKERS = {
-    "doubles": {
-        "disciplines": ("hyrox",),
-        "group": "format",
-        "label": "doubles",
-        "effect": {"base": +1},
-        "why": "In doubles the station reps are shared but both athletes run the "
-               "whole 8 km, so the running is a larger share of your race than in "
-               "singles — one more aerobic session, one less station-dominated one.",
-    },
-    "singles": {
-        "disciplines": ("hyrox",),
-        "group": "format",
-        "label": "singles",
-        "effect": {},
-        "why": "Singles: the standard split of running and stations, which the "
-               "targets already assume.",
-    },
-    "relay": {
-        "disciplines": ("hyrox",),
-        "group": "format",
-        "label": "relay",
-        "effect": {"base": -1},
-        "why": "A relay leg is a fraction of the race, so the aerobic demand is "
-               "lower than a full one.",
-    },
-    "pro": {
-        "disciplines": ("hyrox",),
-        "group": "category",
-        "label": "pro category",
-        "effect": {"strength": +1},
-        "why": "The pro category carries heavier implements throughout, so the "
-               "strength side needs more of the week than open does.",
-    },
-    "elite": {
-        "disciplines": ("hyrox",),
-        "group": "category",
-        "label": "pro category",
-        "effect": {"strength": +1},
-        "why": "The elite/pro category carries heavier implements throughout, so "
-               "the strength side needs more of the week than open does.",
-    },
-    "open": {
-        "disciplines": ("hyrox",),
-        "group": "category",
-        "label": "open category",
-        "effect": {},
-        "why": "Open category: the standard weights, which the targets assume.",
+# category -> (which disciplines offer it, what it changes, why)
+CATEGORIES = {
+    "hyrox": {
+        "open": {
+            "label": "Open (singles)",
+            "effect": {},
+            "why": "Open singles is the standard division, which the targets assume.",
+        },
+        "pro": {
+            "label": "Pro (singles)",
+            "effect": {"strength": +1},
+            "why": "The pro division carries heavier implements throughout, so the "
+                   "strength side needs more of the week than open does.",
+        },
+        "doubles": {
+            "label": "Doubles",
+            "effect": {"base": +1},
+            "why": "In doubles the station reps are shared but both athletes run the "
+                   "whole 8 km, so the running is a larger share of your race than "
+                   "in singles.",
+        },
+        "doubles_pro": {
+            "label": "Pro doubles",
+            "effect": {"base": +1, "strength": +1},
+            "why": "Doubles splits the station reps while both athletes run the whole "
+                   "8 km, and the pro weights are heavier throughout — so the week "
+                   "needs more of both sides.",
+        },
+        "relay": {
+            "label": "Relay",
+            "effect": {"base": -1},
+            "why": "A relay leg is a fraction of the race, so its aerobic demand is "
+                   "lower than a full one.",
+        },
     },
 }
 
 
-def read_notes(goal: Goal | None) -> dict:
-    """Which markers the notes carry, and what they change.
+def categories_for(discipline: str | None) -> dict:
+    """The categories a discipline offers, or {} where it defines none."""
+    return CATEGORIES.get(discipline or "", {})
 
-    Matched on whole words, case-insensitively, so "Doubles, Levivel" is read and
-    a word that merely contains a marker is not.
+
+def describe_category(goal: Goal | None) -> str:
+    """What the category changes, and why. Empty when it changes nothing."""
+    if not goal or not goal.category:
+        return ""
+    spec = categories_for(goal.discipline).get(goal.category)
+    if not spec:
+        return ""
+    return f"{spec['label']}: {spec['why']}"
+
+
+def apply_category(target: WeeklyTarget, goal: Goal | None) -> WeeklyTarget:
+    """The target as the category modifies it.
+
+    A category changes the MIX of a week, never how much of it there is, and no
+    floor is pushed below zero.
     """
-    out = {"found": [], "effect": {}, "why": [], "conflicts": [],
-           "text": (goal.notes if goal else None)}
-    if not goal or not goal.notes:
-        return out
-    text = goal.notes.lower()
-    discipline = goal.discipline or ""
-    by_group: dict[str, list[dict]] = {}
-    for marker, spec in NOTE_MARKERS.items():
-        if discipline not in spec["disciplines"]:
-            continue
-        if not _re.search(r"(?<![\w])" + _re.escape(marker) + r"(?![\w])", text):
-            continue
-        hits = by_group.setdefault(spec["group"], [])
-        if any(h["label"] == spec["label"] for h in hits):
-            continue                      # pro and elite mean the same thing
-        hits.append(spec)
-
-    for group, hits in sorted(by_group.items()):
-        if len(hits) > 1:
-            # "Pro kategória, open nem" names both. Adding their effects would be
-            # nonsense and picking one would be a guess, so neither is applied and
-            # the contradiction is reported — it is the note that needs fixing.
-            out["conflicts"].append(
-                group + ": the note names " +
-                " and ".join(sorted(h["label"] for h in hits)) +
-                ", so neither is applied")
-            continue
-        spec = hits[0]
-        out["found"].append(spec["label"])
-        for field, delta in spec["effect"].items():
-            out["effect"][field] = out["effect"].get(field, 0) + delta
-        out["why"].append(spec["why"])
-    return out
-
-
-def apply_notes(target: WeeklyTarget, goal: Goal | None) -> tuple[WeeklyTarget, dict]:
-    """The target as the notes modify it, and what was read to get there.
-
-    A floor is never pushed below zero, and the session total is left alone: a
-    note changes the MIX of a week, not how much of it there is.
-    """
-    notes = read_notes(goal)
-    if not notes["effect"]:
-        return target, notes
+    if not goal or not goal.category:
+        return target
+    spec = categories_for(goal.discipline).get(goal.category)
+    if not spec or not spec["effect"]:
+        return target
     fields = {"base": target.base, "quality": target.quality,
               "strength": target.strength}
-    for field, delta in notes["effect"].items():
+    for field, delta in spec["effect"].items():
         if field in fields:
             fields[field] = max(0, fields[field] + delta)
-    return (WeeklyTarget(
+    return WeeklyTarget(
         sessions=target.sessions, base=fields["base"], quality=fields["quality"],
         strength=fields["strength"], long_minutes=target.long_minutes,
         max_hard=target.max_hard, max_sessions=target.max_sessions,
         separation_hours=target.separation_hours, focus=target.focus,
-        source=target.source), notes)
-
-
-def unread_note(goal: Goal | None) -> str:
-    """Said out loud when a note carries nothing the rules know.
-
-    A note that looks acted upon and is not is worse than one plainly skipped.
-    """
-    notes = read_notes(goal)
-    if notes["conflicts"]:
-        return "The note contradicts itself — " + "; ".join(notes["conflicts"]) + "."
-    if not goal or not goal.notes or notes["found"]:
-        return ""
-    known = ", ".join(sorted({v["label"] for v in NOTE_MARKERS.values()
-                              if (goal.discipline or "") in v["disciplines"]}))
-    if not known:
-        return (f"The note on this goal is kept as it is written, and nothing in it "
-                f"changes the targets — no marker is defined for a "
-                f"{DISCIPLINE_LABELS.get(goal.discipline or 'other', 'race').lower()}.")
-    return (f"Nothing in the note changes the targets. For this race the rules "
-            f"recognise: {known}.")
+        source=target.source)
 
 
 # ---------------------------------------------------------------------------
@@ -817,16 +765,12 @@ def observations(summary: dict, goal: Goal | None, date: str) -> list[str]:
     if target.focus:
         out.append(f"This week is for: {target.focus}.")
 
-    # What the note changed, and why. Printed BEFORE the gaps, because it changed
-    # the numbers those gaps are measured against — reading "1 of 3" without
-    # knowing the 3 came from "doubles" is reading a number out of nowhere.
-    notes = read_notes(goal)
-    if notes["found"]:
-        out.append("From your note (" + ", ".join(notes["found"]) + "): " +
-                   " ".join(notes["why"]))
-    skipped = unread_note(goal)
-    if skipped:
-        out.append(skipped)
+    # Printed BEFORE the gaps, because the category changed the numbers those gaps
+    # are measured against — reading "1 of 3" without knowing the 3 came from
+    # racing doubles is reading a number out of nowhere.
+    category = describe_category(goal)
+    if category:
+        out.append(category)
 
     shortfalls = gaps(summary, target)
     if not shortfalls:
@@ -879,6 +823,9 @@ def _fmt_goal(g: Goal, date: str) -> str:
         w = weeks_until(g.race_date, date)
         head += (f"  {g.race_date} ({w} week{'' if w == 1 else 's'}, "
                  f"{PHASE_LABELS[phase_for(g.race_date, date)].lower()})")
+    if g.category:
+        spec = categories_for(g.discipline).get(g.category)
+        head += f"  {spec['label'] if spec else g.category}"
     if g.target:
         head += f"  target {g.target}"
     if not g.active:
@@ -910,6 +857,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("name")
     p.add_argument("date", help="ISO date of the race")
     p.add_argument("--discipline", choices=RACE_DISCIPLINES, default="other")
+    p.add_argument("--category", default=None,
+                   help="hyrox: open | pro | doubles | doubles_pro | relay")
     p.add_argument("--target", default=None, help="e.g. 65:00, sub-3:30")
     p.add_argument("--priority", type=int, default=2, help="1 = A race (default 2)")
     p.add_argument("--notes", default=None)
@@ -928,6 +877,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--notes", default=None)
     p.add_argument("--priority", type=int, default=None)
     p.add_argument("--race-date", dest="race_date", default=None)
+    p.add_argument("--category", default=None)
 
     p = sub.add_parser("retire", help="deactivate a goal, keeping its history")
     p.add_argument("goal_id", type=int)
@@ -958,8 +908,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if a.cmd == "race":
         gid = add_goal(conn, Goal(kind="race", name=a.name, discipline=a.discipline,
-                                  race_date=a.date, target=a.target,
-                                  priority=a.priority, notes=a.notes))
+                                  race_date=a.date, category=a.category,
+                                  target=a.target, priority=a.priority,
+                                  notes=a.notes))
         print(f"Added race [{gid}]: {a.name}, {a.date} "
               f"({PHASE_LABELS[phase_for(a.date, today)].lower()} phase this week)")
         return 0
@@ -974,7 +925,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "set":
         changed = update_goal(conn, a.goal_id, name=a.name, target=a.target,
                               notes=a.notes, priority=a.priority,
-                              race_date=a.race_date)
+                              race_date=a.race_date, category=a.category)
         if not changed:
             print(f"Nothing changed — no goal {a.goal_id}, or nothing to set.")
             return 0

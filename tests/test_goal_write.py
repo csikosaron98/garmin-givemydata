@@ -92,7 +92,7 @@ def test_it_takes_no_sql(db):
     params = set(inspect.signature(S.garmin_goal_write).parameters)
     assert "sql" not in params and "query" not in params and "where" not in params
     assert params == {"action", "goal_id", "kind", "name", "discipline", "standing",
-                      "race_date", "target", "priority", "notes"}
+                      "race_date", "category", "target", "priority", "notes"}
 
 
 def test_sql_in_a_field_is_stored_as_text_not_executed(db):

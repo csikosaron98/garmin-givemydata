@@ -432,28 +432,40 @@ def test_the_prescriptions_name_no_sport(db):
             assert sport not in joined, f"{level} prescribes a sport: {headline}"
 
 
-def test_the_note_s_effect_is_explained_in_the_email(db):
-    """Reading "1 of 3" without knowing the 3 came from "doubles" is reading a
-    number out of nowhere."""
+def test_the_category_s_effect_is_explained_in_the_email(db):
+    """Reading "1 of 3" without knowing the 3 came from racing doubles is reading
+    a number out of nowhere."""
     from garmin_mcp.goals import Goal, add_goal
 
     _seed(db, "2026-10-02")
     add_goal(db, Goal(kind="race", name="Hyrox BP", discipline="hyrox",
-                      race_date="2026-12-19", priority=1,
-                      notes="Doubles, Levivel"))
+                      race_date="2026-12-19", priority=1, category="doubles"))
     _add_activity(db, "2026-09-28", "11:00", "strength_training", 70, load=12)
     subject, text, html = build(db, "2026-10-02")
     for half, body in (("text", text), ("html", html)):
-        assert "From your note" in body, f"missing from the {half} half"
-        assert "doubles" in body, f"the marker is not named in the {half} half"
+        assert "Doubles" in body, f"the division is not named in the {half} half"
         assert "8 km" in body, f"and the reason is missing from the {half} half"
 
 
-def test_an_unrecognised_note_is_reported_rather_than_ignored(db):
+def test_a_race_with_no_category_claims_nothing(db):
+    """Every goal entered before the field existed is in this state, and it must
+    read as the plain targets rather than as a division nobody chose."""
     from garmin_mcp.goals import Goal, add_goal
 
     _seed(db, "2026-10-02")
     add_goal(db, Goal(kind="race", name="Wien Hyrox", discipline="hyrox",
                       race_date="2027-02-20", priority=1, notes="Szóló, Bécs"))
     subject, text, html = build(db, "2026-10-02")
-    assert "Nothing in the note changes the targets" in text
+    for word in ("Doubles", "Pro (", "Relay"):
+        assert word not in text, f"the email claims a division: {word}"
+
+
+def test_the_notes_are_kept_but_change_nothing(db):
+    """They went back to being free text when the category became a field. Two
+    paths to one fact disagree eventually."""
+    from garmin_mcp.goals import Goal, add_goal, target_for
+
+    g = Goal(kind="race", name="Hyrox BP", discipline="hyrox",
+             race_date="2026-12-19", priority=1, notes="doubles pro open relay")
+    plain = Goal(kind="race", name="x", discipline="hyrox", race_date="2026-12-19")
+    assert target_for(g, "2026-10-02")[0] == target_for(plain, "2026-10-02")[0]

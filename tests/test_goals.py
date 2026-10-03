@@ -694,119 +694,146 @@ def test_the_half_ironman_long_session_grows_through_the_block():
     assert t[PHASE_TAPER].long_minutes < t[PHASE_PEAK].long_minutes
 
 
-# ---- what the notes say ----------------------------------------------------
-# Free text, read by recognising a documented vocabulary rather than by
-# interpreting the sentence: the morning email runs on a server with no model in
-# it, so anything the page could interpret the email could not.
+# ---- the race's category ---------------------------------------------------
+# A HYROX division is structured data, so it is a field with a dropdown behind it
+# rather than something parsed out of free text. Two paths to one fact disagree
+# eventually, and a note cannot be validated the way a field can.
 
 from garmin_mcp.goals import (  # noqa: E402
-    NOTE_MARKERS,
+    CATEGORIES,
     WeeklyTarget,
-    apply_notes,
-    read_notes,
-    unread_note,
+    apply_category,
+    categories_for,
+    describe_category,
 )
 
 
-def _race(notes, discipline="hyrox"):
+def _race(category=None, discipline="hyrox"):
     return Goal(kind="race", name="R", discipline=discipline,
-                race_date="2027-01-01", notes=notes)
+                race_date="2027-01-01", category=category)
 
 
-def test_doubles_is_read_from_a_sentence_in_hungarian(db):
-    """Áron's real note. Whole-word matching, so it is found inside a sentence."""
-    r = read_notes(_race("Doubles, Levivel — mint Rómában (66:30)"))
-    assert r["found"] == ["doubles"]
-    assert r["effect"] == {"base": 1}
-    assert r["why"] and "8 km" in r["why"][0], "it says why, not just what"
+def test_every_hyrox_division_is_offered():
+    """The real divisions, or one of them is unreachable from the dropdown."""
+    assert set(CATEGORIES["hyrox"]) == {"open", "pro", "doubles", "doubles_pro", "relay"}
 
 
-def test_doubles_moves_the_target_it_claims_to(db):
-    base_target = RACE_TARGETS["hyrox"][PHASE_BUILD]
-    moved, _ = apply_notes(base_target, _race("doubles"))
-    assert moved.base == base_target.base + 1
-    assert moved.sessions == base_target.sessions, (
-        "a note changes the MIX of a week, not how much of it there is")
+def test_every_category_states_what_it_changes_and_why():
+    for discipline, cats in CATEGORIES.items():
+        for name, spec in cats.items():
+            assert spec["label"], f"{discipline}/{name} has no label for the dropdown"
+            assert spec["why"], f"{discipline}/{name} changes a target without saying why"
 
 
-def test_the_pro_category_moves_the_strength_side(db):
-    base_target = RACE_TARGETS["hyrox"][PHASE_BUILD]
-    moved, _ = apply_notes(base_target, _race("Pro category"))
-    assert moved.strength == base_target.strength + 1
-    assert read_notes(_race("elite"))["found"] == ["pro category"], "elite means pro"
+def test_doubles_moves_the_aerobic_side():
+    base = RACE_TARGETS["hyrox"][PHASE_BUILD]
+    moved = apply_category(base, _race("doubles"))
+    assert moved.base == base.base + 1
+    assert moved.sessions == base.sessions, (
+        "a category changes the MIX of a week, not how much of it there is")
 
 
-def test_the_standard_markers_change_nothing(db):
-    """Open and singles are what the targets already assume. They are recognised
-    so the page can say it read them, not because they move anything."""
-    base_target = RACE_TARGETS["hyrox"][PHASE_BUILD]
-    for note in ("open", "singles"):
-        moved, r = apply_notes(base_target, _race(note))
-        assert r["found"], f"{note} is recognised"
-        assert moved == base_target, f"{note} moves nothing"
+def test_pro_moves_the_strength_side():
+    base = RACE_TARGETS["hyrox"][PHASE_BUILD]
+    assert apply_category(base, _race("pro")).strength == base.strength + 1
 
 
-def test_a_contradictory_note_applies_neither(db):
-    """"Pro kategória, open nem" names both. Adding the effects would be nonsense
-    and picking one would be a guess."""
-    r = read_notes(_race("Pro kategória, open nem"))
-    assert r["found"] == [] and r["effect"] == {}
-    assert len(r["conflicts"]) == 1 and "category" in r["conflicts"][0]
-    assert "contradicts itself" in unread_note(_race("Pro kategória, open nem"))
+def test_pro_doubles_moves_both():
+    base = RACE_TARGETS["hyrox"][PHASE_BUILD]
+    moved = apply_category(base, _race("doubles_pro"))
+    assert moved.base == base.base + 1 and moved.strength == base.strength + 1
 
 
-def test_two_markers_from_different_groups_both_apply(db):
-    r = read_notes(_race("doubles, pro"))
-    assert set(r["found"]) == {"doubles", "pro category"}
-    assert r["effect"] == {"base": 1, "strength": 1}
+def test_open_is_the_standard_division_and_changes_nothing():
+    base = RACE_TARGETS["hyrox"][PHASE_BUILD]
+    assert apply_category(base, _race("open")) == base
+    assert describe_category(_race("open")), "it is still explained, it just moves nothing"
 
 
-def test_a_marker_for_another_discipline_is_ignored(db):
-    """"Doubles" means nothing in a running race, and reading it there would move
-    a target for no reason."""
-    assert read_notes(_race("doubles", discipline="running"))["found"] == []
+def test_a_relay_lowers_the_aerobic_demand():
+    base = RACE_TARGETS["hyrox"][PHASE_BUILD]
+    assert apply_category(base, _race("relay")).base == base.base - 1
 
 
-def test_a_note_the_rules_do_not_know_says_so(db):
-    """A note that looks acted upon and is not is worse than one plainly skipped."""
-    said = unread_note(_race("Szóló, Bécs"))
-    assert "Nothing in the note changes the targets" in said
-    assert "doubles" in said, "and it lists what would have worked"
+def test_no_category_set_gets_the_plain_targets():
+    """Every goal entered before the column existed is in this state."""
+    base = RACE_TARGETS["hyrox"][PHASE_BUILD]
+    assert apply_category(base, _race(None)) == base
+    assert describe_category(_race(None)) == ""
 
 
-def test_an_empty_note_says_nothing_at_all(db):
-    assert unread_note(_race(None)) == ""
-    assert unread_note(_race("")) == ""
-    assert read_notes(None)["found"] == []
+def test_a_discipline_with_no_categories_offers_none():
+    assert categories_for("running") == {}
+    assert categories_for(None) == {}
+    base = RACE_TARGETS["running"][PHASE_BUILD]
+    assert apply_category(base, _race("doubles", discipline="running")) == base
 
 
-def test_a_marker_inside_a_longer_word_is_not_a_marker(db):
-    """Whole words only, or "openly" would set the category."""
-    assert read_notes(_race("openly competitive"))["found"] == []
+def test_a_category_the_discipline_does_not_offer_is_refused(db):
+    """Validated, which is the point of a field over a note."""
+    with pytest.raises(ValueError, match="category"):
+        add_goal(db, Goal(kind="race", name="R", discipline="running",
+                          race_date="2027-01-01", category="doubles"))
+    with pytest.raises(ValueError, match="category"):
+        add_goal(db, Goal(kind="race", name="R", discipline="hyrox",
+                          race_date="2027-01-01", category="quadruples"))
 
 
-def test_the_notes_reach_the_target_everyone_uses(db):
-    """Applied inside target_for, so the page, the email and the plan all see the
-    adjusted target without having to remember to ask for it."""
+def test_the_error_names_what_is_allowed(db):
+    """The page shows this message, so it has to be actionable."""
+    with pytest.raises(ValueError) as exc:
+        add_goal(db, Goal(kind="race", name="R", discipline="hyrox",
+                          race_date="2027-01-01", category="quadruples"))
+    assert "doubles" in str(exc.value) and "relay" in str(exc.value)
+
+
+def test_a_category_can_be_set_afterwards(db):
+    from garmin_mcp.goals import update_goal
+
     gid = add_goal(db, Goal(kind="race", name="Hyrox BP", discipline="hyrox",
-                            race_date="2027-01-01", priority=1,
-                            notes="Doubles, Levivel"))
+                            race_date="2027-01-01"))
+    assert update_goal(db, gid, category="doubles") is True
+    assert [g for g in all_goals(db) if g.goal_id == gid][0].category == "doubles"
+
+
+def test_update_refuses_a_category_the_discipline_does_not_offer(db):
+    from garmin_mcp.goals import update_goal
+
+    gid = add_goal(db, Goal(kind="race", name="R", discipline="running",
+                            race_date="2027-01-01"))
+    with pytest.raises(ValueError, match="category"):
+        update_goal(db, gid, category="doubles")
+
+
+def test_changing_the_discipline_and_the_category_together_is_judged_by_the_new_one(db):
+    """Otherwise setting both in one call is refused for the old discipline's
+    sake, which is the one case where doing it in one call matters."""
+    from garmin_mcp.goals import update_goal
+
+    gid = add_goal(db, Goal(kind="race", name="R", discipline="running",
+                            race_date="2027-01-01"))
+    assert update_goal(db, gid, discipline="hyrox", category="doubles") is True
+
+
+def test_the_category_reaches_the_target_everyone_uses(db):
+    gid = add_goal(db, Goal(kind="race", name="Hyrox BP", discipline="hyrox",
+                            race_date="2027-01-01", priority=1, category="doubles"))
     goal = [g for g in all_goals(db) if g.goal_id == gid][0]
     adjusted, phase = target_for(goal, "2026-10-03")
-    plain = RACE_TARGETS["hyrox"][phase]
-    assert adjusted.base == plain.base + 1
+    assert adjusted.base == RACE_TARGETS["hyrox"][phase].base + 1
 
 
-def test_a_floor_is_never_pushed_below_zero(db):
-    """A relay lowers the aerobic side, and a target with -1 base sessions in it
-    would make every gap calculation nonsense."""
+def test_a_floor_is_never_pushed_below_zero():
+    """A relay lowers the aerobic side, and -1 base sessions would make every gap
+    calculation nonsense."""
     t = WeeklyTarget(3, base=0, quality=1, strength=1, long_minutes=0)
-    moved, _ = apply_notes(t, _race("relay"))
-    assert moved.base == 0
+    assert apply_category(t, _race("relay")).base == 0
 
 
-def test_every_marker_declares_a_group_and_a_reason():
-    for marker, spec in NOTE_MARKERS.items():
-        assert spec["group"], f"{marker} has no group, so it can contradict nothing"
-        assert spec["why"], f"{marker} changes a target without saying why"
-        assert spec["disciplines"], f"{marker} applies to no discipline"
+def test_the_advice_explains_the_category(db):
+    """Reading "1 of 3" without knowing the 3 came from racing doubles is reading
+    a number out of nowhere."""
+    add_goal(db, Goal(kind="race", name="Hyrox BP", discipline="hyrox",
+                      race_date="2027-01-01", priority=1, category="doubles"))
+    out = " ".join(observations(_week(db), driving_goal(db, "2026-10-03"), "2026-10-03"))
+    assert "Doubles" in out and "8 km" in out

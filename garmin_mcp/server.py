@@ -3053,7 +3053,8 @@ def garmin_training_goals() -> str:
                     {
                         "goal_id": g.goal_id, "kind": g.kind, "name": g.name,
                         "discipline": g.discipline, "standing": g.standing,
-                        "race_date": g.race_date, "target": g.target,
+                        "race_date": g.race_date, "category": g.category,
+                        "target": g.target,
                         "priority": g.priority, "active": g.active,
                         "created": g.created, "notes": g.notes,
                         "label": g.label,
@@ -3090,6 +3091,7 @@ def garmin_goal_write(
     discipline: str | None = None,
     standing: str | None = None,
     race_date: str | None = None,
+    category: str | None = None,
     target: str | None = None,
     priority: int | None = None,
     notes: str | None = None,
@@ -3100,6 +3102,8 @@ def garmin_goal_write(
 
     ``add`` needs *kind* (``race`` or ``standing``), *name*, and then either
     *discipline* + *race_date* for a race, or *standing* for a standing goal.
+    *category* is the race's division where its discipline defines one — for a
+    HYROX: ``open``, ``pro``, ``doubles``, ``doubles_pro`` or ``relay``.
     ``update`` and ``retire`` need *goal_id*.
 
     Writes only the `training_goal` table, takes no SQL, and validates through the
@@ -3115,8 +3119,9 @@ def garmin_goal_write(
         if action == "add":
             new_id = _goals.add_goal(conn, _goals.Goal(
                 kind=kind or "", name=name or "", discipline=discipline,
-                standing=standing, race_date=race_date, target=target,
-                priority=2 if priority is None else priority, notes=notes))
+                standing=standing, race_date=race_date, category=category,
+                target=target, priority=2 if priority is None else priority,
+                notes=notes))
             log.info("garmin_goal_write add goal_id=%s kind=%s", new_id, kind)
             return json.dumps({"ok": True, "action": "add", "goal_id": new_id})
 
@@ -3132,7 +3137,7 @@ def garmin_goal_write(
         done = _goals.update_goal(
             conn, int(goal_id), name=name, target=target, notes=notes,
             priority=priority, race_date=race_date, discipline=discipline,
-            standing=standing)
+            standing=standing, category=category)
         log.info("garmin_goal_write update goal_id=%s changed=%s", goal_id, done)
         return json.dumps({"ok": done, "action": "update", "goal_id": goal_id}
                           if done else {"error": "nothing to change, or no such goal"})
