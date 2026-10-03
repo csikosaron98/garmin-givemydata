@@ -294,11 +294,17 @@ PRESCRIPTIONS = {
     "easy": ("Easy aerobic day",
              "40–70 minutes conversational. " + zone_text(2) +
              " — if it drifts above the top of Z2, slow down rather than push through."),
+    # These describe the INTENSITY ENVELOPE the day allows, not the session. Which
+    # session to spend it on comes from the week's remainder, below — and naming a
+    # sport here contradicted it: "spend it on running" sat directly above "the
+    # week owes a strength session", and a taper's "hard day" above "nothing is
+    # owed".
     "moderate": ("Moderate day",
-                 "50–80 minutes mostly in Z2 with 2×10–15 minutes of Z3 inside it. "
+                 "50–80 minutes mostly in Z2, with room for 2×10–15 minutes of Z3 "
+                 "inside it if the session calls for it. "
                  + zone_text(2) + ", lifting to " + zone_text(3) + "."),
-    "hard": ("Hard day — spend it on running",
-             "Intervals or a threshold run. 15 minutes warm-up in Z2, then the work in "
+    "hard": ("Hard day",
+             "Room for real intensity. 15 minutes warm-up in Z2, the work in "
              + zone_text(4) + ", then easy Z2 to finish."),
 }
 
@@ -312,6 +318,25 @@ def fmt_hm(hours: float | None) -> str:
         return "—"
     total = int(round(hours * 60))
     return f"{total // 60}:{total % 60:02d}"
+
+
+def todays_focus_line(decision: dict, wk: dict | None, goal, date: str | None) -> str:
+    """What the week still owes that fits today's ceiling, in one sentence.
+
+    The ceiling comes from decide() and is never raised here: a week short of a
+    long run is not a reason to train on a day the body says no. This only
+    chooses WHAT to spend the day on, among what the ceiling already allows —
+    which is the difference between "moderate day" and "moderate day, and the
+    long easy session is the one thing this week still owes".
+    """
+    if not wk or not date:
+        return ""
+    try:
+        target, _phase = _goals.target_for(goal, date)
+        return _goals.todays_focus(decision["level"], wk, target, date)["line"]
+    except Exception as exc:                       # pragma: no cover - defensive
+        log.warning("could not work out today's focus: %s", exc)
+        return ""
 
 
 def week_advice(wk: dict, goal, date: str | None) -> list[str]:
@@ -334,6 +359,10 @@ def render_text(day: dict, decision: dict, rhr_mean, sessions: list[dict],
         lines += [f"Limiting factor: {decision['limiter']}. {decision['detail']}.", ""]
     else:
         lines += [f"Limiting factor: {decision['detail']}.", ""]
+
+    focus = todays_focus_line(decision, wk, goal, date)
+    if focus:
+        lines += [focus, ""]
 
     if sessions:
         lines.append("RECENT SESSIONS")
@@ -392,6 +421,9 @@ def render_html(day: dict, decision: dict, rhr_mean, sessions: list[dict],
     limiter = (f"<b style=\"color:#a8620c;\">Limiting factor &mdash; {decision['limiter']}.</b> "
                f"{decision['detail']}." if decision["limiter"]
                else f"<b style=\"color:#a8620c;\">No limiting factor.</b> {decision['detail']}.")
+    focus = todays_focus_line(decision, wk, goal, date)
+    focus_html = (f'<div style="font-size:13px;color:#20241f;line-height:1.6;'
+                  f'padding-top:10px;">{focus}</div>' if focus else "")
 
     rows = [
         _row("Sleep", f"<b>{fmt_hm(day.get('sleep_h'))}</b> &middot; score {day.get('sleep_score', '&mdash;')}"),
@@ -458,7 +490,7 @@ def render_html(day: dict, decision: dict, rhr_mean, sessions: list[dict],
 <div style="font-size:21px;font-weight:600;color:#20241f;margin:8px 0 4px;">{headline}</div>
 <div style="font-size:14.5px;color:#20241f;line-height:1.55;">{body}</div>
 <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:12px 0 0;"><tr>
-<td style="background:#f6e6ce;border-left:3px solid #a8620c;padding:12px 14px;font-size:13px;color:#20241f;line-height:1.55;">{limiter}</td>
+<td style="background:#f6e6ce;border-left:3px solid #a8620c;padding:12px 14px;font-size:13px;color:#20241f;line-height:1.55;">{limiter}{focus_html}</td>
 </tr></table>
 </td></tr>
 {'<tr><td style="padding:22px 28px 0;"><div style="font-size:11px;letter-spacing:.07em;text-transform:uppercase;color:#6b6a5e;font-weight:700;padding-bottom:6px;">Recent sessions</div><table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="font-size:13.5px;color:#20241f;">' + session_rows + '</table></td></tr>' if session_rows else ''}

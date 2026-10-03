@@ -471,6 +471,141 @@ def met(summary: dict, target: WeeklyTarget) -> bool:
     return not gaps(summary, target)
 
 
+# ---------------------------------------------------------------------------
+# what the week still owes, and what of it fits today
+# ---------------------------------------------------------------------------
+# The daily brief already decides how HARD today may be, from readiness, recovery
+# and sleep. That ceiling is not negotiable and nothing here raises it: a week
+# short of a long run is not a reason to train on a day the body says no.
+#
+# What was missing is the other half — WHAT to spend the day on. Picking it from
+# the week's remainder is the difference between "moderate day" and "moderate
+# day, and the long easy session is the one thing this week still owes".
+
+# The readiness ladder, lowest first. A copy of brief.LEVELS rather than an
+# import, because brief imports this module; a test pins the two together.
+LEVELS = ("rest", "recovery", "easy", "moderate", "hard")
+
+# The lowest ceiling each kind of session can be done under. Quality needs a hard
+# day and nothing less — that is what makes a hard day worth spending on it.
+# Strength and easy aerobic work sit at "easy": both are possible on a moderate
+# day too, but neither needs one.
+QUALITY_MIN_LEVEL = {
+    "aerobic_quality": "hard",
+    "aerobic_base": "easy",
+    "long": "easy",
+    "strength": "easy",
+}
+
+# Scarcity order, most constrained first. Quality outranks the long session on a
+# day that allows both: a long run only needs a day with time in it, while a
+# quality session needs a day the body will take — and those are rarer.
+FOCUS_ORDER = ("aerobic_quality", "long", "aerobic_base", "strength")
+
+FOCUS_LABELS = {
+    "aerobic_quality": "a quality session",
+    "long": "the long easy session",
+    "aerobic_base": "an easy aerobic session",
+    "strength": "a strength session",
+}
+
+
+def days_left(date: str) -> int:
+    """Days remaining in the week, today included. Monday is day one of seven."""
+    return 7 - _dt.date.fromisoformat(date).weekday()
+
+
+def week_remainder(summary: dict, target: WeeklyTarget, date: str) -> dict:
+    """What the week still owes, and whether there is time left to pay it."""
+    c = summary["counts"]
+    owed: dict[str, int] = {}
+    if c["aerobic_base"] < target.base:
+        owed["aerobic_base"] = target.base - c["aerobic_base"]
+    if c["aerobic_quality"] < target.quality:
+        owed["aerobic_quality"] = target.quality - c["aerobic_quality"]
+    if c["strength"] < target.strength:
+        owed["strength"] = target.strength - c["strength"]
+    # The long session is a property of one of the base sessions, not a session of
+    # its own — counting it as extra work would overstate what the week owes.
+    long_missing = bool(target.long_minutes
+                        and summary["longest_base_minutes"] < target.long_minutes)
+    left = days_left(date)
+    sessions_owed = sum(owed.values())
+    # A taper that is already at its ceiling owes nothing, whatever is "missing":
+    # the point of the week is less work, so asking for more would contradict it.
+    capped = (target.max_sessions is not None
+              and summary["sessions"] >= target.max_sessions)
+    return {
+        "owed": {} if capped else owed,
+        "long_missing": False if capped else long_missing,
+        "sessions_owed": 0 if capped else sessions_owed,
+        "days_left": left,
+        "capped": capped,
+        # Honest rather than encouraging: with more owed than days left, saying so
+        # is more use than a plan that cannot be followed.
+        "feasible": capped or sessions_owed <= left,
+    }
+
+
+def todays_focus(level: str, summary: dict, target: WeeklyTarget, date: str) -> dict:
+    """Which of the week's remaining work fits today's ceiling.
+
+    `level` is the brief's own decision about how hard today may be. This never
+    raises it — it only chooses among what that ceiling already allows.
+    """
+    rem = week_remainder(summary, target, date)
+    out = {"focus": None, "line": "", "remainder": rem}
+
+    if level not in LEVELS:
+        return out
+    ceiling = LEVELS.index(level)
+
+    if rem["capped"]:
+        out["line"] = ("This week has had its sessions — it is a taper, and coming "
+                       "down is the point. Nothing is owed.")
+        return out
+
+    if not rem["owed"] and not rem["long_missing"]:
+        out["line"] = "The week has met its goal already; anything today is a bonus."
+        return out
+
+    if ceiling <= LEVELS.index("recovery"):
+        out["line"] = ("The week still owes work, but not today — today's ceiling "
+                       "is set by how you recovered, and that comes first.")
+        return out
+
+    for kind in FOCUS_ORDER:
+        wanted = rem["long_missing"] if kind == "long" else rem["owed"].get(kind)
+        if not wanted:
+            continue
+        if LEVELS.index(QUALITY_MIN_LEVEL[kind]) > ceiling:
+            continue
+        out["focus"] = kind
+        if kind == "long":
+            out["line"] = (f"Of what the week still owes, {FOCUS_LABELS[kind]} is the "
+                           f"one that fits today — {target.long_minutes} min or more, "
+                           "and the longest so far is "
+                           f"{summary['longest_base_minutes']:.0f}.")
+        else:
+            out["line"] = (f"Of what the week still owes, {FOCUS_LABELS[kind]} is the "
+                           f"one that fits today ({wanted} short).")
+        break
+
+    if out["focus"] is None:
+        # Everything outstanding needs a harder day than this one allows. Saying
+        # which, and that it has to wait, beats saying nothing.
+        waiting = [FOCUS_LABELS[k] for k in FOCUS_ORDER
+                   if (rem["long_missing"] if k == "long" else rem["owed"].get(k))]
+        out["line"] = ("What the week still owes — " + ", ".join(waiting) +
+                       " — needs a harder day than today allows.")
+
+    if not rem["feasible"]:
+        out["line"] += (f" {rem['sessions_owed']} sessions outstanding with "
+                        f"{rem['days_left']} days left: the week will fall short, "
+                        "and choosing what matters most beats chasing all of it.")
+    return out
+
+
 def describe_goal(goal: Goal | None, date: str) -> str:
     """One line naming the goal and where in it this week sits."""
     if goal is None:

@@ -521,3 +521,146 @@ def test_updating_a_goal_that_is_not_there_says_so(db):
     from garmin_mcp.goals import update_goal
 
     assert update_goal(db, 9999, target="x") is False
+
+
+# ---- what the week still owes, and what of it fits today ------------------
+# The brief already decides how HARD today may be. This is the other half: WHAT
+# to spend the day on. The ceiling is never raised here — a week short of a long
+# run is not a reason to train on a day the body says no.
+
+from garmin_mcp.goals import (  # noqa: E402
+    FOCUS_ORDER,
+    LEVELS,
+    QUALITY_MIN_LEVEL,
+    days_left,
+    todays_focus,
+    week_remainder,
+)
+
+
+def test_the_level_ladder_matches_the_brief_s_own():
+    """A copy, because brief imports this module — so it has to be pinned."""
+    from garmin_mcp.brief import LEVELS as BRIEF_LEVELS
+
+    assert LEVELS == BRIEF_LEVELS
+
+
+def test_every_focus_kind_has_a_minimum_level():
+    for kind in FOCUS_ORDER:
+        assert QUALITY_MIN_LEVEL[kind] in LEVELS
+
+
+def test_days_left_counts_today(db):
+    assert days_left("2026-10-05") == 7, "Monday leaves the whole week"
+    assert days_left("2026-10-09") == 3, "Friday leaves Friday, Saturday, Sunday"
+    assert days_left("2026-10-11") == 1, "Sunday leaves only Sunday"
+
+
+def _target(db, goal_kw, date):
+    gid = add_goal(db, Goal(**goal_kw))
+    return target_for(driving_goal(db, date), date)[0], gid
+
+
+def test_a_hard_day_goes_to_the_quality_session(db):
+    """Scarcity: a long run only needs a day with time in it, a quality session
+    needs a day the body will take — and those are rarer."""
+    t, _ = _target(db, dict(kind="race", name="W", discipline="hyrox",
+                            race_date="2027-02-20", priority=1), "2026-11-04")
+    s = _week(db, ("2026-11-02", "11:00", "strength_training", 70, {"load": 12}))
+    out = todays_focus("hard", summarize(db, "2026-11-04"), t, "2026-11-04")
+    assert out["focus"] == "aerobic_quality"
+    assert "quality session" in out["line"]
+
+
+def test_a_moderate_day_cannot_take_the_quality_session(db):
+    """Which is exactly why a hard day is spent on one."""
+    t, _ = _target(db, dict(kind="race", name="W", discipline="hyrox",
+                            race_date="2027-02-20", priority=1), "2026-11-04")
+    _week(db, ("2026-11-02", "11:00", "strength_training", 70, {"load": 12}))
+    out = todays_focus("moderate", summarize(db, "2026-11-04"), t, "2026-11-04")
+    assert out["focus"] == "long", "it falls to the next thing the day allows"
+    assert str(t.long_minutes) in out["line"], "and states the length that counts"
+
+
+def test_a_rest_day_is_never_overridden_by_the_week(db):
+    """The ceiling comes first. This is the rule that keeps the feature honest."""
+    t, _ = _target(db, dict(kind="race", name="W", discipline="hyrox",
+                            race_date="2027-02-20", priority=1), "2026-11-04")
+    _week(db)
+    for level in ("rest", "recovery"):
+        out = todays_focus(level, summarize(db, "2026-11-04"), t, "2026-11-04")
+        assert out["focus"] is None
+        assert "not today" in out["line"]
+
+
+def test_a_week_already_at_its_goal_says_so(db):
+    t, _ = _target(db, dict(kind="standing", name="M", standing="maintenance"),
+                   "2026-11-04")
+    s = _week(db,
+              ("2026-11-02", "11:00", "strength_training", 70, {"load": 12}),
+              ("2026-11-03", "11:00", "strength_training", 70, {"load": 12}),
+              ("2026-11-03", "09:00", "running", 70, {"load": 80, "z1": 1200, "z2": 3000}),
+              ("2026-11-04", "09:00", "running", 65, {"load": 80, "z1": 1200, "z2": 2700}),
+              ("2026-11-04", "18:00", "hiit", 50, {"load": 160, "z4": 1200}),
+              ("2026-11-04", "06:00", "cycling", 40, {"load": 30, "z1": 1200, "z2": 1200}))
+    out = todays_focus("hard", summarize(db, "2026-11-04"), t, "2026-11-04")
+    assert out["focus"] is None and "met its goal" in out["line"]
+
+
+def test_a_taper_at_its_ceiling_owes_nothing(db):
+    """Asking for more in a taper would contradict the point of the week, however
+    much is nominally "missing"."""
+    t, _ = _target(db, dict(kind="race", name="Spar", discipline="running",
+                            race_date="2026-10-11", priority=1), "2026-10-02")
+    _week(db, *[(d, "11:00", "strength_training", 70, {"load": 12})
+                for d in ("2026-09-28", "2026-09-29", "2026-09-30",
+                          "2026-10-01", "2026-10-02")])
+    s = summarize(db, "2026-10-02")
+    rem = week_remainder(s, t, "2026-10-02")
+    assert rem["capped"] is True and rem["sessions_owed"] == 0
+    out = todays_focus("hard", s, t, "2026-10-02")
+    assert out["focus"] is None and "taper" in out["line"]
+
+
+def test_more_owed_than_days_left_is_said_plainly(db):
+    """Honest beats encouraging: a plan that cannot be followed is worse than
+    being told to pick what matters."""
+    t, _ = _target(db, dict(kind="race", name="W", discipline="hyrox",
+                            race_date="2027-02-20", priority=1), "2026-11-07")
+    _week(db)
+    out = todays_focus("hard", summarize(db, "2026-11-07"), t, "2026-11-07")
+    assert "will fall short" in out["line"]
+    assert "2 days left" in out["line"]
+
+
+def test_a_feasible_week_is_not_told_it_will_fall_short(db):
+    t, _ = _target(db, dict(kind="race", name="W", discipline="hyrox",
+                            race_date="2027-02-20", priority=1), "2026-11-02")
+    _week(db)
+    out = todays_focus("hard", summarize(db, "2026-11-02"), t, "2026-11-02")
+    assert "fall short" not in out["line"], "Monday has the whole week ahead"
+
+
+def test_the_long_session_is_not_counted_as_an_extra_session(db):
+    """It is a property of one of the base sessions, not work of its own —
+    counting it separately would overstate what the week owes."""
+    t, _ = _target(db, dict(kind="standing", name="M", standing="maintenance"),
+                   "2026-11-04")
+    _week(db,
+          ("2026-11-02", "09:00", "running", 40, {"load": 70, "z1": 1200, "z2": 1200}),
+          ("2026-11-03", "09:00", "running", 40, {"load": 70, "z1": 1200, "z2": 1200}))
+    rem = week_remainder(summarize(db, "2026-11-04"), t, "2026-11-04")
+    assert rem["long_missing"] is True
+    assert rem["owed"].get("aerobic_base") is None, "both base sessions are done"
+    # One quality and two strength. The long session is missing as well, and the
+    # count stays at three: it is a longer version of a base session that is
+    # already counted, not a fourth session to fit in.
+    assert rem["owed"] == {"aerobic_quality": 1, "strength": 2}
+    assert rem["sessions_owed"] == 3
+
+
+def test_an_unknown_level_returns_nothing_rather_than_guessing(db):
+    t, _ = _target(db, dict(kind="standing", name="M", standing="maintenance"),
+                   "2026-11-04")
+    out = todays_focus("extremely hard", summarize(db, "2026-11-04"), t, "2026-11-04")
+    assert out["focus"] is None and out["line"] == ""
