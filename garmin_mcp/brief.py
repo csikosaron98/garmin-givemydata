@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import logging
 import os
 import smtplib
@@ -49,14 +50,16 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 # The ceiling ladder. Every rule lowers it; none ever raises it.
 LEVELS = ("rest", "recovery", "easy", "moderate", "hard")
 
-# Áron's own zones, from his Garmin profile (HRmax 189, LTHR 169, RHR ~41).
-ZONES = {
-    1: (95, 112),
-    2: (113, 131),
-    3: (132, 150),
-    4: (151, 169),
-    5: (170, 189),
-}
+# Which heart-rate profile the advice is written against, most specific first.
+# Garmin keeps one per sport, and they are NOT the same: Áron's RUNNING profile
+# sits on a lactate threshold of 171 while his DEFAULT sits on 169, which moves
+# every boundary by several beats. The advice is almost always about running, so
+# the running profile wins where there is one.
+#
+# This replaced a hard-coded table that had gone stale: it carried HRmax 189 and
+# a Z4 of 151-169, which matched NEITHER profile in the database. A prescription
+# that names a bpm range is only worth anything if the range is his.
+ZONE_SPORT_ORDER = ("RUNNING", "DEFAULT")
 
 # Only send inside a plausible morning. Outside it the night's figures are no
 # longer "this morning's", and a brief that says they are would be wrong.
@@ -281,32 +284,77 @@ def decide(day: dict, rhr_mean: float | None, sessions: list[dict]) -> dict:
     return {"level": level, "limiter": limiter, "detail": detail, "notes": notes}
 
 
-def zone_text(z: int) -> str:
-    lo, hi = ZONES[z]
-    return f"Z{z} {lo}–{hi} bpm"
+def read_zones(conn: sqlite3.Connection) -> dict | None:
+    """The athlete's own zone boundaries, from the most specific profile stored.
+
+    Returns ``{"sport": .., "lthr": .., "max": .., "zones": {1: (lo, hi), ..}}``,
+    or None when no profile has been synced. None is a real answer: a bpm range
+    is only advice if it is his, and inventing one would be worse than saying Z4.
+    """
+    rows = {}
+    for (raw,) in conn.execute("SELECT raw_json FROM hr_zones"):
+        try:
+            d = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if d.get("sport"):
+            rows[d["sport"]] = d
+    profile = next((rows[s] for s in ZONE_SPORT_ORDER if s in rows), None)
+    if not profile:
+        return None
+    floors = [profile.get(f"zone{n}Floor") for n in range(1, 6)]
+    if any(not isinstance(f, (int, float)) for f in floors):
+        return None
+    top = profile.get("maxHeartRateUsed")
+    zones = {}
+    for i in range(5):
+        lo = int(floors[i])
+        # Each zone ends one beat below the next one's floor; the fifth ends at
+        # the measured maximum, and has no upper bound when that is missing.
+        hi = int(floors[i + 1]) - 1 if i < 4 else (int(top) if top else None)
+        zones[i + 1] = (lo, hi)
+    return {"sport": profile["sport"], "lthr": profile.get("lactateThresholdHeartRateUsed"),
+            "max": int(top) if top else None, "zones": zones}
 
 
-PRESCRIPTIONS = {
-    "rest": ("Rest day",
-             "No training. Walking is fine; nothing that raises your heart rate."),
-    "recovery": ("Recovery day",
-                 "20–40 minutes very easy, or nothing at all. " + zone_text(1) + "."),
-    "easy": ("Easy aerobic day",
-             "40–70 minutes conversational. " + zone_text(2) +
-             " — if it drifts above the top of Z2, slow down rather than push through."),
-    # These describe the INTENSITY ENVELOPE the day allows, not the session. Which
-    # session to spend it on comes from the week's remainder, below — and naming a
-    # sport here contradicted it: "spend it on running" sat directly above "the
-    # week owes a strength session", and a taper's "hard day" above "nothing is
-    # owed".
-    "moderate": ("Moderate day",
-                 "50–80 minutes mostly in Z2, with room for 2×10–15 minutes of Z3 "
-                 "inside it if the session calls for it. "
-                 + zone_text(2) + ", lifting to " + zone_text(3) + "."),
-    "hard": ("Hard day",
-             "Room for real intensity. 15 minutes warm-up in Z2, the work in "
-             + zone_text(4) + ", then easy Z2 to finish."),
-}
+def zone_text(zones: dict | None, z: int) -> str:
+    """"Z4 164–172 bpm", or a bare "Z4" when no profile has been synced."""
+    band = (zones or {}).get("zones", {}).get(z)
+    if not band:
+        return f"Z{z}"
+    lo, hi = band
+    return f"Z{z} {lo}–{hi} bpm" if hi else f"Z{z} {lo}+ bpm"
+
+
+def prescriptions(zones: dict | None) -> dict:
+    """The day's headline and prescription, per ceiling.
+
+    A function rather than a module constant because the zones come from the
+    database now: built at import time, these carried whatever table happened to
+    be hard-coded, which is how a stale Z4 survived a profile change.
+
+    They describe the INTENSITY ENVELOPE the day allows, not the session. Which
+    session to spend it on comes from the week's remainder — and naming a sport
+    here contradicted that: "spend it on running" sat directly above "the week
+    owes a strength session".
+    """
+    z = lambda n: zone_text(zones, n)        # noqa: E731 - a local shorthand
+    return {
+        "rest": ("Rest day",
+                 "No training. Walking is fine; nothing that raises your heart rate."),
+        "recovery": ("Recovery day",
+                     "20–40 minutes very easy, or nothing at all. " + z(1) + "."),
+        "easy": ("Easy aerobic day",
+                 "40–70 minutes conversational. " + z(2) +
+                 " — if it drifts above the top of Z2, slow down rather than push through."),
+        "moderate": ("Moderate day",
+                     "50–80 minutes mostly in Z2, with room for 2×10–15 minutes of Z3 "
+                     "inside it if the session calls for it. "
+                     + z(2) + ", lifting to " + z(3) + "."),
+        "hard": ("Hard day",
+                 "Room for real intensity. 15 minutes warm-up in Z2, the work in "
+                 + z(4) + ", then easy Z2 to finish."),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -339,6 +387,86 @@ def todays_focus_line(decision: dict, wk: dict | None, goal, date: str | None) -
         return ""
 
 
+# The race headline replaces the ceiling's, because on these two days the
+# ceiling is not what the day is about. It is still computed and still reported
+# as data — a poor readiness on race morning is worth knowing — but it stops
+# being the thing the email leads with.
+def race_prescription(goal, when: str, zones: dict | None) -> tuple[str, str]:
+    name = getattr(goal, "name", None) or "the race"
+    target = getattr(goal, "target", None)
+    if when == "today":
+        aim = f" You are racing {target}." if target else ""
+        return (f"Race day — {name}",
+                "Nothing this morning makes you fitter, and several things can make "
+                f"you slower. Warm up the way you have rehearsed it, and race.{aim}")
+    return (f"Pre-race day — {name} tomorrow",
+            "Short and easy, with a few minutes at race pace to open up. "
+            + zone_text(zones, 2) + " for the easy part. Nothing new today: no "
+            "session this close pays off tomorrow, and several could cost it.")
+
+
+def verdict(conn: sqlite3.Connection, date: str) -> dict | None:
+    """Everything the day's judgement is, in one place.
+
+    The morning email renders this, and `garmin_training_verdict` returns it as
+    JSON so the page and any other consumer judge the same day the same way.
+    Before this, the ceiling lived inside the email's rendering and nothing else
+    could reach it.
+    """
+    day = read_day(conn, date)
+    if day is None:
+        return None
+    rhr_mean = rhr_baseline(conn, date)
+    sessions = recent_sessions(conn, date)
+    decision = decide(day, rhr_mean, sessions)
+    zones = read_zones(conn)
+
+    try:
+        goal = _goals.driving_goal(conn, date)
+    except Exception as exc:
+        log.warning("could not read the goal: %s", exc)
+        goal = None
+    try:
+        wk = _week.summarize(conn, date)
+    except Exception as exc:
+        log.warning("could not summarise the week: %s", exc)
+        wk = None
+
+    race = _goals.race_proximity(goal, date)
+    target, phase = _goals.target_for(goal, date)
+    if race:
+        headline, body = race_prescription(goal, race, zones)
+        focus = {"focus": None,
+                 "line": ("The race is this week's session." if race == "today"
+                          else "Whatever the week still owes, it waits until after "
+                               "the race.")}
+    else:
+        headline, body = prescriptions(zones)[decision["level"]]
+        focus = (_goals.todays_focus(decision["level"], wk, target, date) if wk
+                 else {"focus": None, "line": ""})
+
+    return {
+        "date": date,
+        "level": decision["level"],
+        "headline": headline,
+        "prescription": body,
+        "limiter": decision["limiter"],
+        "detail": decision["detail"],
+        "notes": decision["notes"],
+        "race": race,
+        "goal": _goals.describe_goal(goal, date),
+        "goal_id": getattr(goal, "goal_id", None),
+        "phase": phase,
+        "zones": zones,
+        "week": wk,
+        "week_focus": focus["line"],
+        "week_advice": (_goals.observations(wk, goal, date) if wk else []),
+        "day": day,
+        "rhr_baseline": rhr_mean,
+        "sessions": sessions,
+    }
+
+
 def week_advice(wk: dict, goal, date: str | None) -> list[str]:
     """The week's advice, from the goal layer when a goal is set.
 
@@ -352,15 +480,19 @@ def week_advice(wk: dict, goal, date: str | None) -> list[str]:
 
 
 def render_text(day: dict, decision: dict, rhr_mean, sessions: list[dict],
-                wk: dict | None = None, goal=None, date: str | None = None) -> str:
-    headline, body = PRESCRIPTIONS[decision["level"]]
+                wk: dict | None = None, goal=None, date: str | None = None,
+                v: dict | None = None) -> str:
+    # The headline and the week line come from verdict() when it is passed, so
+    # the email cannot disagree with the tool that serves the same judgement.
+    headline, body = ((v["headline"], v["prescription"]) if v
+                      else prescriptions(None)[decision["level"]])
     lines = [f"TODAY — {headline}", "", body, ""]
     if decision["limiter"]:
         lines += [f"Limiting factor: {decision['limiter']}. {decision['detail']}.", ""]
     else:
         lines += [f"Limiting factor: {decision['detail']}.", ""]
 
-    focus = todays_focus_line(decision, wk, goal, date)
+    focus = v["week_focus"] if v else todays_focus_line(decision, wk, goal, date)
     if focus:
         lines += [focus, ""]
 
@@ -411,17 +543,19 @@ def _row(label: str, value: str) -> str:
 
 
 def render_html(day: dict, decision: dict, rhr_mean, sessions: list[dict],
-                date: str, wk: dict | None = None, goal=None) -> str:
+                date: str, wk: dict | None = None, goal=None,
+                v: dict | None = None) -> str:
     """Table layout and inline styles only — mail clients strip <style> blocks
     and support neither flex nor grid. Palette matches the dashboard so the two
     read as one system.
     """
-    headline, body = PRESCRIPTIONS[decision["level"]]
+    headline, body = ((v["headline"], v["prescription"]) if v
+                      else prescriptions(None)[decision["level"]])
     pretty = _dt.date.fromisoformat(date).strftime("%A %-d %B")
     limiter = (f"<b style=\"color:#a8620c;\">Limiting factor &mdash; {decision['limiter']}.</b> "
                f"{decision['detail']}." if decision["limiter"]
                else f"<b style=\"color:#a8620c;\">No limiting factor.</b> {decision['detail']}.")
-    focus = todays_focus_line(decision, wk, goal, date)
+    focus = v["week_focus"] if v else todays_focus_line(decision, wk, goal, date)
     focus_html = (f'<div style="font-size:13px;color:#20241f;line-height:1.6;'
                   f'padding-top:10px;">{focus}</div>' if focus else "")
 
@@ -566,32 +700,26 @@ def send_email(cfg: dict, subject: str, text: str, html: str) -> None:
 
 def build(conn: sqlite3.Connection, date: str) -> tuple[str, str, str] | None:
     """(subject, text, html), or None when the night has not landed yet."""
-    day = read_day(conn, date)
-    if day is None:
+    v = verdict(conn, date)
+    if v is None:
         return None
-    rhr_mean = rhr_baseline(conn, date)
-    sessions = recent_sessions(conn, date)
-    decision = decide(day, rhr_mean, sessions)
-    # The week so far, so the brief can say what is still MISSING rather than
-    # only what today's readiness allows. A broken tally must not cost the brief.
-    try:
-        wk = _week.summarize(conn, date)
-    except Exception as exc:
-        log.warning("could not summarise the week: %s", exc)
-        wk = None
-    # The goal the week is judged against. None is a legitimate answer, and a
-    # failure here must cost the brief no more than the goal line: the rest of
-    # the email is about today, which does not depend on it.
+    day, sessions = v["day"], v["sessions"]
+    rhr_mean, wk = v["rhr_baseline"], v["week"]
+    decision = {"level": v["level"], "limiter": v["limiter"],
+                "detail": v["detail"], "notes": v["notes"]}
     try:
         goal = _goals.driving_goal(conn, date)
-    except Exception as exc:
-        log.warning("could not read the goal: %s", exc)
+    except Exception:
         goal = None
     pretty = _dt.date.fromisoformat(date).strftime("%A %-d %B")
+    # The subject says what kind of day it is. "Training brief" above a race-day
+    # email reads as a training instruction, which is the one thing it is not.
+    subject = (f"{v['headline']} — {pretty}" if v["race"]
+               else f"Training brief — {pretty}")
     return (
-        f"Training brief — {pretty}",
-        render_text(day, decision, rhr_mean, sessions, wk, goal, date),
-        render_html(day, decision, rhr_mean, sessions, date, wk, goal),
+        subject,
+        render_text(day, decision, rhr_mean, sessions, wk, goal, date, v),
+        render_html(day, decision, rhr_mean, sessions, date, wk, goal, v),
     )
 
 

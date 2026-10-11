@@ -424,9 +424,9 @@ def test_a_rest_day_email_does_not_ask_for_the_week_s_work(db):
 def test_the_prescriptions_name_no_sport(db):
     """They describe the intensity the day allows; WHICH session comes from the
     week's remainder. Naming a sport here contradicted that line directly."""
-    from garmin_mcp.brief import PRESCRIPTIONS
+    from garmin_mcp.brief import prescriptions
 
-    for level, (headline, body) in PRESCRIPTIONS.items():
+    for level, (headline, body) in prescriptions(None).items():
         joined = (headline + " " + body).lower()
         for sport in ("running", "run.", "a run", "cycling", "swim", "gym"):
             assert sport not in joined, f"{level} prescribes a sport: {headline}"
@@ -469,3 +469,168 @@ def test_the_notes_are_kept_but_change_nothing(db):
              race_date="2026-12-19", priority=1, notes="doubles pro open relay")
     plain = Goal(kind="race", name="x", discipline="hyrox", race_date="2026-12-19")
     assert target_for(g, "2026-10-02")[0] == target_for(plain, "2026-10-02")[0]
+
+
+# ---- the zones come from the athlete's own profile -------------------------
+# They were hard-coded, and had gone stale: HRmax 189 with a Z4 of 151-169,
+# which matched NEITHER profile in the database. A prescription that names a bpm
+# range is only worth something if the range is his.
+
+def _zone_row(conn, sport, lthr, floors, top=190):
+    import json as _json
+    conn.execute("INSERT INTO hr_zones (raw_json) VALUES (?)", (_json.dumps({
+        "sport": sport, "lactateThresholdHeartRateUsed": lthr,
+        "maxHeartRateUsed": top, "restingHeartRateUsed": 40,
+        "zone1Floor": floors[0], "zone2Floor": floors[1], "zone3Floor": floors[2],
+        "zone4Floor": floors[3], "zone5Floor": floors[4]}),))
+    conn.commit()
+
+
+def test_the_running_profile_wins_over_the_default(db):
+    """Áron's real two: the running threshold is 171 and the default 169, which
+    moves every boundary by several beats."""
+    from garmin_mcp.brief import read_zones
+
+    _zone_row(db, "DEFAULT", 169, [110, 135, 150, 162, 169])
+    _zone_row(db, "RUNNING", 171, [113, 139, 152, 164, 173])
+    z = read_zones(db)
+    assert z["sport"] == "RUNNING" and z["lthr"] == 171
+    assert z["zones"][4] == (164, 172), "Z4 ends one beat below the Z5 floor"
+    assert z["zones"][5] == (173, 190), "Z5 runs to the measured maximum"
+    assert z["zones"][1] == (113, 138)
+
+
+def test_the_default_profile_is_used_when_there_is_no_running_one(db):
+    from garmin_mcp.brief import read_zones
+
+    _zone_row(db, "DEFAULT", 169, [110, 135, 150, 162, 169])
+    assert read_zones(db)["sport"] == "DEFAULT"
+
+
+def test_no_profile_at_all_is_a_real_answer(db):
+    """A bpm range is only advice if it is his. Inventing one is worse than
+    saying Z4 and leaving it at that."""
+    from garmin_mcp.brief import prescriptions, read_zones, zone_text
+
+    assert read_zones(db) is None
+    assert zone_text(None, 4) == "Z4", "no numbers are made up"
+    assert "bpm" not in prescriptions(None)["hard"][1]
+
+
+def test_the_prescription_carries_his_real_zone(db):
+    from garmin_mcp.brief import prescriptions, read_zones
+
+    _zone_row(db, "RUNNING", 171, [113, 139, 152, 164, 173])
+    body = prescriptions(read_zones(db))["hard"][1]
+    assert "164–172 bpm" in body
+    assert "151–169" not in body, "the stale hard-coded band is gone"
+
+
+def test_a_malformed_profile_does_not_crash_the_brief(db):
+    from garmin_mcp.brief import read_zones
+
+    db.execute("INSERT INTO hr_zones (raw_json) VALUES ('not json')")
+    db.execute("INSERT INTO hr_zones (raw_json) VALUES ('{\"sport\":\"RUNNING\"}')")
+    db.commit()
+    assert read_zones(db) is None, "a profile with no floors is no profile"
+
+
+def test_the_email_prints_the_running_zone(db):
+    _seed(db, "2026-10-02")
+    _zone_row(db, "DEFAULT", 169, [110, 135, 150, 162, 169])
+    _zone_row(db, "RUNNING", 171, [113, 139, 152, 164, 173])
+    subject, text, html = build(db, "2026-10-02")
+    assert "151–169" not in text, "the stale band must not reach the email"
+
+
+# ---- race day --------------------------------------------------------------
+# The ceiling rules know nothing about races, so on a well-rested race morning
+# they said "Hard day, room for real intensity". True, and useless: the race is
+# the session. This happened to Áron on 2026-10-11, the morning of the SPAR half.
+
+def test_race_day_replaces_the_hard_day_verdict(db):
+    from garmin_mcp.brief import verdict
+    from garmin_mcp.goals import Goal, add_goal
+
+    _seed(db, "2026-10-11")          # a clear morning: the rules would say hard
+    add_goal(db, Goal(kind="race", name="Spar félmaraton", discipline="running",
+                      race_date="2026-10-11", target="1:26:30", priority=1))
+    v = verdict(db, "2026-10-11")
+    assert v["race"] == "today"
+    assert v["headline"] == "Race day — Spar félmaraton"
+    assert "1:26:30" in v["prescription"], "the target is part of the day"
+    assert "Hard day" not in v["headline"]
+    assert "Room for real intensity" not in v["prescription"]
+
+
+def test_the_ceiling_is_still_computed_on_race_day(db):
+    """A poor readiness on race morning is worth knowing — it just stops being
+    the thing the email leads with."""
+    from garmin_mcp.brief import verdict
+    from garmin_mcp.goals import Goal, add_goal
+
+    _seed(db, "2026-10-11", readiness=20)
+    add_goal(db, Goal(kind="race", name="Spar", discipline="running",
+                      race_date="2026-10-11", priority=1))
+    v = verdict(db, "2026-10-11")
+    assert v["race"] == "today" and v["level"] in ("rest", "recovery")
+    assert v["limiter"], "the limiting factor is still reported"
+
+
+def test_the_day_before_is_a_pre_race_day(db):
+    from garmin_mcp.brief import verdict
+    from garmin_mcp.goals import Goal, add_goal
+
+    _seed(db, "2026-10-10")
+    add_goal(db, Goal(kind="race", name="Spar", discipline="running",
+                      race_date="2026-10-11", priority=1))
+    v = verdict(db, "2026-10-10")
+    assert v["race"] == "tomorrow"
+    assert v["headline"].startswith("Pre-race day")
+    assert "Nothing new" in v["prescription"]
+
+
+def test_two_days_out_is_an_ordinary_day(db):
+    from garmin_mcp.brief import verdict
+    from garmin_mcp.goals import Goal, add_goal
+
+    _seed(db, "2026-10-09")
+    add_goal(db, Goal(kind="race", name="Spar", discipline="running",
+                      race_date="2026-10-11", priority=1))
+    assert verdict(db, "2026-10-09")["race"] is None
+
+
+def test_the_week_does_not_ask_for_work_on_race_day(db):
+    """"Of what the week still owes, a quality session fits today" is not what
+    you want to read on the start line."""
+    from garmin_mcp.brief import verdict
+    from garmin_mcp.goals import Goal, add_goal
+
+    _seed(db, "2026-10-11")
+    add_goal(db, Goal(kind="race", name="Spar", discipline="running",
+                      race_date="2026-10-11", priority=1))
+    v = verdict(db, "2026-10-11")
+    assert "fits today" not in v["week_focus"]
+    assert "race" in v["week_focus"].lower()
+
+
+def test_the_subject_says_it_is_a_race_day(db):
+    """"Training brief" above a race-day email reads as a training instruction,
+    which is the one thing it is not."""
+    from garmin_mcp.goals import Goal, add_goal
+
+    _seed(db, "2026-10-11")
+    add_goal(db, Goal(kind="race", name="Spar félmaraton", discipline="running",
+                      race_date="2026-10-11", priority=1))
+    subject, text, html = build(db, "2026-10-11")
+    assert subject.startswith("Race day — Spar félmaraton")
+    for half, body in (("text", text), ("html", html)):
+        assert "Race day" in body, f"missing from the {half} half"
+
+
+def test_a_standing_goal_is_never_a_race_day(db):
+    from garmin_mcp.goals import Goal, race_proximity
+
+    g = Goal(kind="standing", name="Maintenance", standing="maintenance")
+    assert race_proximity(g, "2026-10-11") is None
+    assert race_proximity(None, "2026-10-11") is None

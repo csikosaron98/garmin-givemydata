@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 from datetime import date, timedelta
+from datetime import date as date_cls
 
 try:  # mcp SDK v1
     from mcp.server.fastmcp import FastMCP
@@ -3149,6 +3150,53 @@ def garmin_goal_write(
     except Exception:
         log.exception("garmin_goal_write failed")
         return json.dumps({"error": "Could not write the goal."})
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def garmin_training_verdict(date: str | None = None) -> str:
+    """Today's judgement: how hard the day may be, what set that ceiling, and
+    what the week still owes against the athlete's own goal.
+
+    The same rule set the morning email renders — readiness, recovery time, HRV
+    against his own baseline, sleep, resting heart rate, and the hard/easy
+    alternation — each one able only to LOWER the day's ceiling, never raise it.
+    The limiting factor named is whichever rule set the final level.
+
+    Two things it knows that a generic reading of the data does not. The heart-
+    rate zones come from his own Garmin profile, preferring the sport-specific
+    one over the default — they are NOT interchangeable. And if a race falls
+    today or tomorrow, the verdict is the race, not a training prescription.
+
+    Returns JSON. `level` is one of rest, recovery, easy, moderate, hard;
+    `race` is "today", "tomorrow" or null; `zones` carries the real bpm bands.
+    Nothing here is medical advice.
+    """
+    from . import brief as _brief
+
+    conn = get_connection()
+    try:
+        when = date or date_cls.today().isoformat()
+        v = _brief.verdict(conn, when)
+        if v is None:
+            return json.dumps({
+                "date": when, "ready": False,
+                "note": "The night has not landed yet — no sleep or readiness row "
+                        "for this date. Garmin writes them after the watch syncs "
+                        "and its own processing runs."})
+        # The raw day and session rows are left out: a caller that wants them has
+        # garmin_today and garmin_activities, and they would triple this payload.
+        out = {k: v[k] for k in (
+            "date", "level", "headline", "prescription", "limiter", "detail",
+            "notes", "race", "goal", "goal_id", "phase", "zones",
+            "week_focus", "week_advice")}
+        out["ready"] = True
+        out["week"] = {k: v["week"][k] for k in
+                       ("week_start", "through", "sessions", "days", "total_minutes",
+                        "counts", "minutes", "longest_base_minutes", "has_long_base",
+                        "interference")} if v["week"] else None
+        return json.dumps(out, separators=(",", ":"), default=str)
     finally:
         conn.close()
 

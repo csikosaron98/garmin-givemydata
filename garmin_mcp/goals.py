@@ -740,6 +740,24 @@ def todays_focus(level: str, summary: dict, target: WeeklyTarget, date: str) -> 
     return out
 
 
+def race_proximity(goal: Goal | None, date: str) -> str | None:
+    """"today", "tomorrow", or None — is a race upon us?
+
+    The daily ceiling rules know nothing about races: they read readiness,
+    recovery, HRV and sleep, and on a well-rested race morning they say "hard
+    day, room for real intensity". Which is true and useless. The race is the
+    session, and nothing the rules suggest belongs beside it.
+    """
+    if not goal or goal.kind != "race" or not goal.race_date:
+        return None
+    try:
+        gap = (_dt.date.fromisoformat(goal.race_date)
+               - _dt.date.fromisoformat(date)).days
+    except ValueError:
+        return None
+    return {0: "today", 1: "tomorrow"}.get(gap)
+
+
 def describe_goal(goal: Goal | None, date: str) -> str:
     """One line naming the goal and where in it this week sits."""
     if goal is None:
