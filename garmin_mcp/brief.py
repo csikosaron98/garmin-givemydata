@@ -714,7 +714,7 @@ def build(conn: sqlite3.Connection, date: str) -> tuple[str, str, str] | None:
     pretty = _dt.date.fromisoformat(date).strftime("%A %-d %B")
     # The subject says what kind of day it is. "Training brief" above a race-day
     # email reads as a training instruction, which is the one thing it is not.
-    subject = (f"{v['headline']} — {pretty}" if v["race"]
+    subject = (f"{v['headline']} · {pretty}" if v["race"]
                else f"Training brief — {pretty}")
     return (
         subject,

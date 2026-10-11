@@ -623,7 +623,7 @@ def test_the_subject_says_it_is_a_race_day(db):
     add_goal(db, Goal(kind="race", name="Spar félmaraton", discipline="running",
                       race_date="2026-10-11", priority=1))
     subject, text, html = build(db, "2026-10-11")
-    assert subject.startswith("Race day — Spar félmaraton")
+    assert subject.startswith("Race day — Spar félmaraton · ")
     for half, body in (("text", text), ("html", html)):
         assert "Race day" in body, f"missing from the {half} half"
 
