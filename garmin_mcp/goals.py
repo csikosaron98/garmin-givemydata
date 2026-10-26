@@ -609,6 +609,56 @@ def record_result(conn: sqlite3.Connection, goal_id: int, result: str,
     return changed
 
 
+def garmin_prs(conn: sqlite3.Connection, goal: Goal | None) -> list[dict]:
+    """Garmin's own personal records set during the race, newest-best first.
+
+    Which distance each `typeId` means is NOT inferred: Garmin returns
+    `prTypeLabelKey` as null, so the numbers carry no label and guessing one
+    would be the plausible kind of made-up. What the data does support is telling
+    a TIME from a DISTANCE — a split time cannot exceed the activity's own
+    duration, and a distance record matches its distance. That is a derivation,
+    not a guess, and it is enough: for a race, the longest split is the race.
+
+    Deliberately avoids `pr_type` 12-16, whose rows arrive with no name, no sport
+    and no date, and values that are nonsense.
+    """
+    if not goal or not goal.race_date:
+        return []
+    conn.row_factory = sqlite3.Row
+    act = conn.execute(
+        "SELECT activity_id, duration_seconds, distance_meters, activity_name "
+        "FROM activity WHERE substr(start_time_local,1,10) = ? "
+        "ORDER BY duration_seconds DESC LIMIT 1", (goal.race_date,)).fetchone()
+    if not act or not act["duration_seconds"]:
+        return []
+    duration = float(act["duration_seconds"])
+    rows = conn.execute(
+        "SELECT pr_type, value FROM personal_record "
+        "WHERE activity_id = ? AND value IS NOT NULL "
+        "AND CAST(pr_type AS INTEGER) NOT BETWEEN 12 AND 16",
+        (act["activity_id"],)).fetchall()
+    out = []
+    for r in rows:
+        v = float(r["value"])
+        if v <= duration:
+            # Truncated, not rounded: a race time is the second you crossed on,
+            # so 1:24:28.76 is 1:24:28 — which is what Garmin shows, and what the
+            # result sheet will say.
+            secs = int(v)
+            out.append({"pr_type": r["pr_type"], "seconds": secs,
+                        "time": fmt_seconds(secs),
+                        "activity": act["activity_name"]})
+    out.sort(key=lambda x: -x["seconds"])
+    return out
+
+
+def suggest_result(conn: sqlite3.Connection, goal: Goal | None) -> str:
+    """The time most likely to be the race result: the longest split Garmin
+    recorded in it. Empty when there is nothing to offer."""
+    prs = garmin_prs(conn, goal)
+    return prs[0]["time"] if prs else ""
+
+
 def race_prediction(conn: sqlite3.Connection, goal: Goal | None) -> dict | None:
     """Garmin's own prediction for the race's distance, as it stood on the day.
 
@@ -1016,7 +1066,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("result", help="record what happened, and close the race")
     p.add_argument("goal_id", type=int)
-    p.add_argument("result", help="e.g. 1:24:38, 66:12, DNF")
+    p.add_argument("result", nargs="?", default=None,
+                   help="e.g. 1:24:38, 66:12, DNF — omit to see what Garmin recorded")
     p.add_argument("--note", default=None, help="anything else about how it went")
     p.add_argument("--keep-active", action="store_true",
                    help="do not retire it (unusual: a race with a result is over)")
@@ -1079,6 +1130,24 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if a.cmd == "result":
+        if not a.result:
+            goal = next((g for g in all_goals(conn, include_retired=True)
+                         if g.goal_id == a.goal_id), None)
+            if not goal:
+                print(f"No goal with id {a.goal_id}.")
+                return 0
+            prs = garmin_prs(conn, goal)
+            if not prs:
+                print(f"[{a.goal_id}] {goal.name}: Garmin recorded no personal "
+                      "record in that day's activity. Pass the result yourself.")
+                return 0
+            print(f"[{a.goal_id}] {goal.name} — Garmin's own records from "
+                  f"{prs[0]['activity']}:")
+            for pr in prs:
+                print(f"    {pr['time']}")
+            print(f"\n  Longest split, almost always the race itself: {prs[0]['time']}")
+            print(f"  To store it:  goals result {a.goal_id} {prs[0]['time']}")
+            return 0
         if not record_result(conn, a.goal_id, a.result, a.note,
                              retire=not a.keep_active):
             print(f"No goal with id {a.goal_id}.")

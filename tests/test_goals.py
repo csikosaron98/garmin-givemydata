@@ -1015,3 +1015,105 @@ def test_only_running_has_predictions(db):
                                     race_date="2026-10-17")) is None
     assert race_prediction(db, Goal(kind="standing", name="m", standing="maintenance")) is None
     assert race_prediction(db, None) is None
+
+
+# ---- what Garmin recorded in the race --------------------------------------
+# The result was already in the database and nobody looked: four personal
+# records from the SPAR half, the longest of them 1:24:28, while the goal sat
+# marked "not recorded".
+
+from garmin_mcp.goals import garmin_prs, suggest_result  # noqa: E402
+
+
+def _race_day(db, date="2026-10-11", duration=5473, distance=22729.33, aid=999):
+    db.execute("INSERT INTO activity (activity_id, activity_type, activity_name, "
+               "start_time_local, duration_seconds, distance_meters) "
+               "VALUES (?,?,?,?,?,?)",
+               (aid, "running", "SPAR Budapest Marathon (Half Marathon)",
+                f"{date} 11:01:09", duration, distance))
+    db.commit()
+    return aid
+
+
+def _pr(db, aid, pr_type, value):
+    db.execute("INSERT INTO personal_record (pr_type, activity_id, value) "
+               "VALUES (?,?,?)", (pr_type, aid, value))
+    db.commit()
+
+
+def test_the_races_own_records_come_back_longest_first(db):
+    aid = _race_day(db)
+    for t, v in [("3", 1148.9), ("4", 2340.8), ("5", 5068.76), ("7", 22729.33)]:
+        _pr(db, aid, t, v)
+    g = Goal(kind="race", name="Spar", discipline="running", race_date="2026-10-11")
+    prs = garmin_prs(db, g)
+    # All truncated, not rounded: 2340.8 s is 39:00, not 39:01.
+    assert [p["time"] for p in prs] == ["1:24:28", "39:00", "19:08"]
+    assert suggest_result(db, g) == "1:24:28", "the longest split is the race"
+
+
+def test_a_distance_record_is_not_offered_as_a_time(db):
+    """22 729 is metres, and offering it as six and a half hours would be the
+    plausible kind of wrong. A split time cannot exceed the activity's duration,
+    which is a derivation rather than a guess."""
+    aid = _race_day(db)
+    _pr(db, aid, "7", 22729.33)
+    g = Goal(kind="race", name="Spar", discipline="running", race_date="2026-10-11")
+    assert garmin_prs(db, g) == []
+
+
+def test_the_broken_record_types_are_never_offered(db):
+    """pr_type 12-16 arrive with no name, no sport, no date, and nonsense
+    values. 38 175 would read as a 10-hour half marathon."""
+    aid = _race_day(db)
+    for t, v in [("12", 38175.0), ("13", 141893.0), ("15", 13.0), ("16", 5.0)]:
+        _pr(db, aid, t, v)
+    g = Goal(kind="race", name="Spar", discipline="running", race_date="2026-10-11")
+    assert garmin_prs(db, g) == []
+
+
+def test_a_race_with_no_activity_offers_nothing(db):
+    g = Goal(kind="race", name="Spar", discipline="running", race_date="2026-10-11")
+    assert garmin_prs(db, g) == [] and suggest_result(db, g) == ""
+
+
+def test_a_race_with_an_activity_but_no_records_offers_nothing(db):
+    _race_day(db)
+    g = Goal(kind="race", name="Spar", discipline="running", race_date="2026-10-11")
+    assert garmin_prs(db, g) == []
+
+
+def test_records_from_another_day_are_not_borrowed(db):
+    aid = _race_day(db, date="2026-10-11")
+    other = _race_day(db, date="2026-09-27", duration=4000, aid=1000)
+    _pr(db, other, "5", 3990.0)
+    g = Goal(kind="race", name="Spar", discipline="running", race_date="2026-10-11")
+    assert garmin_prs(db, g) == []
+
+
+def test_the_longest_activity_of_the_day_is_the_race(db):
+    """A warm-up logged separately must not be mistaken for the race."""
+    _race_day(db, aid=999, duration=5473)
+    db.execute("INSERT INTO activity (activity_id, activity_type, activity_name, "
+               "start_time_local, duration_seconds, distance_meters) "
+               "VALUES (1001,'running','Warm-up','2026-10-11 10:20:00',900,2000)")
+    db.commit()
+    _pr(db, 999, "5", 5068.76)
+    _pr(db, 1001, "1", 300.0)
+    g = Goal(kind="race", name="Spar", discipline="running", race_date="2026-10-11")
+    assert [p["time"] for p in garmin_prs(db, g)] == ["1:24:28"]
+
+
+def test_nothing_is_offered_without_a_date(db):
+    assert garmin_prs(db, Goal(kind="standing", name="M", standing="maintenance")) == []
+    assert garmin_prs(db, None) == []
+
+
+def test_a_race_time_is_truncated_not_rounded(db):
+    """You crossed the line at 1:24:28.76, and your time is 1:24:28 — which is
+    what Garmin shows and what the result sheet says. Rounding would hand back a
+    second you never ran."""
+    aid = _race_day(db)
+    _pr(db, aid, "5", 5068.76)
+    g = Goal(kind="race", name="Spar", discipline="running", race_date="2026-10-11")
+    assert garmin_prs(db, g)[0]["time"] == "1:24:28"
