@@ -675,3 +675,48 @@ def test_a_broken_verdict_table_costs_the_caller_nothing(db):
     db.execute("DROP TABLE daily_verdict")
     db.commit()
     assert verdict(db, "2026-10-26") is not None, "the verdict still comes back"
+
+
+def test_an_illness_note_only_ever_lowers_the_ceiling(db):
+    """A note may lower the day and never raise it. Mutation found this: with the
+    guard removed, an illness note would lift a rest day to recovery — the one
+    direction a note must never move anything."""
+    from garmin_mcp.brief import verdict
+    from garmin_mcp.notes import add_note
+
+    _seed(db, "2026-10-26", readiness=5, sleep_time_seconds=3 * 3600)
+    plain = verdict(db, "2026-10-26")
+    assert plain["level"] == "rest", "the rules already say rest"
+    db.execute("DELETE FROM daily_verdict")
+    db.commit()
+
+    add_note(db, "2026-10-26", "Náthás vagyok", "illness")
+    with_note = verdict(db, "2026-10-26")
+    assert with_note["level"] == "rest", "the note must not lift it to recovery"
+
+
+def test_an_illness_note_lowers_an_otherwise_good_day(db):
+    from garmin_mcp.brief import verdict
+    from garmin_mcp.notes import add_note
+
+    _seed(db, "2026-10-26")
+    assert verdict(db, "2026-10-26")["level"] not in ("rest", "recovery")
+    db.execute("DELETE FROM daily_verdict")
+    db.commit()
+
+    add_note(db, "2026-10-26", "Náthás vagyok", "illness")
+    v = verdict(db, "2026-10-26")
+    assert v["level"] == "recovery"
+    assert v["limiter"] == "your own note", "and it says so, like any other rule"
+    assert "ill" in v["detail"]
+
+
+def test_the_days_note_reaches_the_verdict(db):
+    from garmin_mcp.brief import verdict
+    from garmin_mcp.notes import add_note
+
+    _seed(db, "2026-10-26")
+    add_note(db, "2026-10-26", "Húz a vádli", "niggle")
+    v = verdict(db, "2026-10-26")
+    assert "Húz a vádli" in v["notes"]
+    assert v["level"] not in ("rest", "recovery"), "a niggle is reported, not graded"

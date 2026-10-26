@@ -192,9 +192,14 @@ def test_two_days_is_not_enough(db):
 
 def test_the_baseline_excludes_the_days_being_judged(db):
     """Otherwise a sustained rise lifts the mean it is measured against and hides
-    itself — the longer it goes on, the less it shows."""
-    seed_days(db, 21, rhr=lambda i: 40 if i < 18 else 44)
-    assert anomalies(db, "2026-10-26"), "a 4 bpm rise over a 40 bpm mean is visible"
+    itself — the longer it goes on, the less it shows.
+
+    The size matters for this to discriminate: a big rise clears the threshold
+    either way. Three days at 3.5 bpm over a clean 40 bpm mean is above the line
+    when the three are excluded (3.5) and below it when they are folded in
+    (3.0 exactly, and the comparison is strict)."""
+    seed_days(db, 21, rhr=lambda i: 40 if i < 18 else 43.5)
+    assert anomalies(db, "2026-10-26"), "a 3.5 bpm rise over a 40 bpm mean is visible"
 
 
 def test_hrv_below_its_own_floor_is_noticed(db):
