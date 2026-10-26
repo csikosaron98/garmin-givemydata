@@ -39,6 +39,7 @@ from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
+from . import adherence as _adherence
 from . import goals as _goals
 from . import week as _week
 from .db import DB_PATH, get_connection
@@ -445,7 +446,7 @@ def verdict(conn: sqlite3.Connection, date: str) -> dict | None:
         focus = (_goals.todays_focus(decision["level"], wk, target, date) if wk
                  else {"focus": None, "line": ""})
 
-    return {
+    out = {
         "date": date,
         "level": decision["level"],
         "headline": headline,
@@ -465,6 +466,14 @@ def verdict(conn: sqlite3.Connection, date: str) -> dict | None:
         "rhr_baseline": rhr_mean,
         "sessions": sessions,
     }
+    # Written here, once per day, so every consumer of the verdict records the
+    # same judgement — and so the first one of the day is the one kept. A failure
+    # to record must not cost the caller its verdict.
+    try:
+        _adherence.record_verdict(conn, out)
+    except Exception as exc:                       # pragma: no cover - defensive
+        log.warning("could not record the verdict: %s", exc)
+    return out
 
 
 def week_advice(wk: dict, goal, date: str | None) -> list[str]:

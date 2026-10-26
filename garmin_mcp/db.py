@@ -816,6 +816,28 @@ CREATE TABLE IF NOT EXISTS training_goal (
     notes       TEXT
 );
 
+-- What the system said, on the morning it said it. The verdict used to be
+-- computed and thrown away, so the one question worth asking about a daily
+-- adviser — is it any good? — had no data behind it.
+--
+-- One row per day, written the FIRST time a verdict is computed and never
+-- overwritten: training_readiness is recomputed after every session, so an
+-- evening recomputation would quietly replace the morning judgement with a
+-- post-session one. `recorded_at` says when it was actually taken, because a
+-- verdict first computed in the afternoon is a different thing from a 07:45 one.
+CREATE TABLE IF NOT EXISTS daily_verdict (
+    calendar_date TEXT PRIMARY KEY,
+    level         TEXT NOT NULL,
+    headline      TEXT,
+    limiter       TEXT,
+    detail        TEXT,
+    race          TEXT,
+    goal_id       INTEGER,
+    phase         TEXT,
+    week_focus    TEXT,
+    recorded_at   TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_goal_active ON training_goal (active, priority, race_date);
 CREATE INDEX IF NOT EXISTS idx_act_weather ON activity_weather (activity_id);
 CREATE INDEX IF NOT EXISTS idx_trackpoints_activity ON activity_trackpoints (activity_id);

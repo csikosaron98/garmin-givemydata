@@ -3217,6 +3217,39 @@ def garmin_training_verdict(date: str | None = None) -> str:
         conn.close()
 
 
+@mcp.tool()
+def garmin_verdict_history(days: int = 30) -> str:
+    """What the daily verdict said, beside what the day actually came to.
+
+    The verdict used to be computed and discarded, so the question worth asking
+    about a daily adviser — is it any good, and do I act on it? — had no data
+    behind it. One row per day is now kept, written the first time a verdict is
+    computed and never overwritten: readiness is recomputed after every session,
+    so a later call would replace the morning judgement with a post-session one.
+
+    Two limits on what this claims. A day's sessions are graded on four rungs
+    (rest, recovery, easy, hard); "moderate" cannot be separated from "easy" in
+    the data, so a moderate verdict counts as followed by either. And it reports
+    that the two differ, never why — a hard day against a rest verdict might be a
+    mistake or might be the day the rules did not know about.
+
+    Returns JSON: `rows` newest first, `summary` with the counts, and
+    `observations` in plain words. Nothing here is medical advice.
+    """
+    from . import adherence as _adherence
+
+    conn = get_connection()
+    try:
+        rows = _adherence.history(conn, max(1, min(int(days), 365)))
+        return json.dumps({
+            "rows": rows,
+            "summary": _adherence.summarize(rows),
+            "observations": _adherence.observations(rows),
+        }, separators=(",", ":"), default=str)
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
