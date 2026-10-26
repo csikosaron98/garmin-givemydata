@@ -634,3 +634,44 @@ def test_a_standing_goal_is_never_a_race_day(db):
     g = Goal(kind="standing", name="Maintenance", standing="maintenance")
     assert race_proximity(g, "2026-10-11") is None
     assert race_proximity(None, "2026-10-11") is None
+
+
+def test_computing_a_verdict_records_it(db):
+    """Mutation found this twice before in other shapes: a value computed and
+    dropped breaks no test, because every assertion lives on the function that
+    produces it and none on it reaching anywhere."""
+    from garmin_mcp.brief import verdict
+
+    _seed(db, "2026-10-26")
+    assert db.execute("SELECT count(*) FROM daily_verdict").fetchone()[0] == 0
+    v = verdict(db, "2026-10-26")
+    row = db.execute("SELECT * FROM daily_verdict WHERE calendar_date = ?",
+                     ("2026-10-26",)).fetchone()
+    assert row is not None, "the verdict was computed and thrown away"
+    assert row["level"] == v["level"]
+    assert row["headline"] == v["headline"]
+
+
+def test_a_second_call_keeps_the_morning_verdict(db):
+    """readiness is recomputed after every session, so the afternoon's verdict
+    must not replace the one that was actually acted on."""
+    from garmin_mcp.brief import verdict
+
+    _seed(db, "2026-10-26")
+    first = verdict(db, "2026-10-26")["level"]
+    db.execute("UPDATE training_readiness SET score = 5, level = 'POOR' "
+               "WHERE calendar_date = '2026-10-26'")
+    db.commit()
+    second = verdict(db, "2026-10-26")["level"]
+    assert second != first, "the recomputed verdict does change"
+    stored = db.execute("SELECT level FROM daily_verdict").fetchone()[0]
+    assert stored == first, "but what was recorded is still the morning's"
+
+
+def test_a_broken_verdict_table_costs_the_caller_nothing(db):
+    from garmin_mcp.brief import verdict
+
+    _seed(db, "2026-10-26")
+    db.execute("DROP TABLE daily_verdict")
+    db.commit()
+    assert verdict(db, "2026-10-26") is not None, "the verdict still comes back"
