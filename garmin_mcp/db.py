@@ -838,6 +838,22 @@ CREATE TABLE IF NOT EXISTS daily_verdict (
     recorded_at   TEXT NOT NULL
 );
 
+-- What the watch cannot see. Everything else in this database is measured; the
+-- things that actually explain a bad week — ill, travelling, a deadline, a calf
+-- that hurts — are not measurable, and without them the system reads "resting
+-- heart rate up four beats" and has no idea it was a head cold.
+--
+-- Several notes per day are allowed on purpose: a morning note and an evening
+-- one are both real, and overwriting one with the other would lose it.
+CREATE TABLE IF NOT EXISTS daily_note (
+    note_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    calendar_date TEXT NOT NULL,
+    note          TEXT NOT NULL,
+    tags          TEXT,
+    created       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_note_date ON daily_note (calendar_date);
 CREATE INDEX IF NOT EXISTS idx_goal_active ON training_goal (active, priority, race_date);
 CREATE INDEX IF NOT EXISTS idx_act_weather ON activity_weather (activity_id);
 CREATE INDEX IF NOT EXISTS idx_trackpoints_activity ON activity_trackpoints (activity_id);

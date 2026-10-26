@@ -3206,7 +3206,8 @@ def garmin_training_verdict(date: str | None = None) -> str:
         out = {k: v[k] for k in (
             "date", "level", "headline", "prescription", "limiter", "detail",
             "notes", "race", "goal", "goal_id", "phase", "zones",
-            "week_focus", "week_advice")}
+            "week_focus", "week_advice", "ask")}
+        out["your_note"] = v["notes"]
         out["ready"] = True
         out["week"] = {k: v["week"][k] for k in
                        ("week_start", "through", "sessions", "days", "total_minutes",
@@ -3245,6 +3246,71 @@ def garmin_verdict_history(days: int = 30) -> str:
             "rows": rows,
             "summary": _adherence.summarize(rows),
             "observations": _adherence.observations(rows),
+        }, separators=(",", ":"), default=str)
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def garmin_note_write(date: str | None = None, note: str = "",
+                      tags: str | None = None,
+                      action: str = "add", note_id: int | None = None) -> str:
+    """Write down what the watch cannot see, or remove a note.
+
+    Everything else in this database is measured. The things that explain a bad
+    week — ill, travelling, a deadline, a calf that hurts — are not, and without
+    them the system reads "resting heart rate up four beats" and has no idea it
+    was a head cold.
+
+    *tags* is a comma-separated list from: illness, niggle, travel, stress,
+    alcohol. Unknown words are dropped rather than stored, because a tag nothing
+    can read quietly stops meaning anything — the note itself keeps the words.
+    Only `illness` changes the day's advice, lowering its ceiling to recovery.
+
+    *action* is "add" (the default) or "delete", which needs *note_id*.
+    Nothing here is medical advice.
+    """
+    from . import notes as _notes
+
+    conn = get_connection()
+    try:
+        if action == "delete":
+            if note_id is None:
+                return json.dumps({"error": "delete needs note_id"})
+            done = _notes.delete_note(conn, int(note_id))
+            return json.dumps({"ok": done, "action": "delete", "note_id": note_id}
+                              if done else {"error": f"no note with id {note_id}"})
+        if action != "add":
+            return json.dumps({"error": "action must be add or delete"})
+        when = date or date_cls.today().isoformat()
+        new_id = _notes.add_note(conn, when, note, tags)
+        log.info("garmin_note_write add note_id=%s date=%s tags=%s",
+                 new_id, when, _notes.normalise_tags(tags))
+        return json.dumps({"ok": True, "action": "add", "note_id": new_id,
+                           "date": when, "tags": _notes.normalise_tags(tags)})
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+    except Exception:
+        log.exception("garmin_note_write failed")
+        return json.dumps({"error": "Could not write the note."})
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def garmin_notes(days: int = 30) -> str:
+    """The notes written over the last *days*, newest first, with the tag
+    vocabulary and what each tag does."""
+    from . import notes as _notes
+
+    conn = get_connection()
+    try:
+        end = date_cls.today()
+        start = (end - timedelta(days=max(1, min(int(days), 365)) - 1)).isoformat()
+        return json.dumps({
+            "notes": _notes.notes_between(conn, start, end.isoformat()),
+            "tags": {k: {"label": v["label"], "caps_at": v["caps_at"],
+                         "why": v["why"]} for k, v in _notes.TAGS.items()},
         }, separators=(",", ":"), default=str)
     finally:
         conn.close()

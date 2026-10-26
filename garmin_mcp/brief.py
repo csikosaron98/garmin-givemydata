@@ -41,6 +41,7 @@ from pathlib import Path
 
 from . import adherence as _adherence
 from . import goals as _goals
+from . import notes as _notes
 from . import week as _week
 from .db import DB_PATH, get_connection
 
@@ -50,6 +51,12 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 # The ceiling ladder. Every rule lowers it; none ever raises it.
 LEVELS = ("rest", "recovery", "easy", "moderate", "hard")
+
+# How far above his own fourteen-day mean a resting heart rate has to sit before
+# it counts as elevated. Defined in brief_thresholds so notes.py can read the
+# same number without a circular import — "elevated" meaning two different things
+# in one system is drift that is only ever noticed by accident.
+from .brief_thresholds import RHR_OVER_BASELINE
 
 # Which heart-rate profile the advice is written against, most specific first.
 # Garmin keeps one per sport, and they are NOT the same: Áron's RUNNING profile
@@ -251,7 +258,7 @@ def decide(day: dict, rhr_mean: float | None, sessions: list[dict]) -> dict:
         cap("easy", "HRV", f"HRV {hrv:.0f} ms, below your baseline floor of {hrv_low:.0f}")
 
     rhr = day.get("rhr")
-    if rhr is not None and rhr_mean is not None and rhr > rhr_mean + 3:
+    if rhr is not None and rhr_mean is not None and rhr > rhr_mean + RHR_OVER_BASELINE:
         cap("easy", "resting heart rate",
             f"Resting HR {rhr} bpm against a {rhr_mean} bpm 14-day mean")
 
@@ -433,6 +440,15 @@ def verdict(conn: sqlite3.Connection, date: str) -> dict | None:
         log.warning("could not summarise the week: %s", exc)
         wk = None
 
+    # A note only ever LOWERS the ceiling, and only an illness note lowers
+    # anything — the same conservative direction the sleep and readiness rules
+    # already move in. It becomes the limiting factor like any other rule, so the
+    # email still says why today is what it is.
+    note_cap, note_reason = _notes.cap_from_notes(conn, date)
+    if note_cap and LEVELS.index(note_cap) < LEVELS.index(decision["level"]):
+        decision = {**decision, "level": note_cap, "limiter": "your own note",
+                    "detail": note_reason}
+
     race = _goals.race_proximity(goal, date)
     target, phase = _goals.target_for(goal, date)
     if race:
@@ -465,6 +481,10 @@ def verdict(conn: sqlite3.Connection, date: str) -> dict | None:
         "day": day,
         "rhr_baseline": rhr_mean,
         "sessions": sessions,
+        "notes": _notes.describe_notes(conn, date),
+        # Asked only when something has been off for three days running, and only
+        # when there is no note already. A daily prompt decays inside a fortnight.
+        "ask": _notes.should_ask(conn, date),
     }
     # Written here, once per day, so every consumer of the verdict records the
     # same judgement — and so the first one of the day is the one kept. A failure
