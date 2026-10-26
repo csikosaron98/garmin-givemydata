@@ -241,3 +241,22 @@ def test_an_ordinary_week_is_not_scolded(db):
     out = " ".join(observations(history(db, days=7, through="2026-10-26")))
     assert "went hard against" not in out
     assert "1 of 1" in out
+
+
+def test_an_easy_day_against_a_recovery_verdict_is_not_called_hard(db):
+    """Found on live data: an easy session against a recovery verdict counts as
+    "exceeded", and the sentence claimed it "went hard". It did not."""
+    record_verdict(db, V("2026-10-26", "recovery"))
+    add(db, "2026-10-26", "11:00", "strength_training", 59, load=12, z1=3000)
+    rows = history(db, days=7, through="2026-10-26")
+    assert rows[0]["adherence"] == "exceeded" and rows[0]["done"] == "easy"
+    out = " ".join(observations(rows))
+    assert "went hard" not in out, "an easy day is not a hard one"
+    assert "without going hard" in out, "but it is still counted"
+
+
+def test_a_genuinely_hard_day_against_rest_still_earns_the_sentence(db):
+    record_verdict(db, V("2026-10-25", "rest"))
+    add(db, "2026-10-25", "18:00", "hiit", 50, load=200, z4=1200)
+    out = " ".join(observations(history(db, days=7, through="2026-10-26")))
+    assert "went hard against a rest" in out

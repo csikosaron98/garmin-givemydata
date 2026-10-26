@@ -161,16 +161,22 @@ def observations(rows: list[dict]) -> list[str]:
     if s["judged"]:
         out.append(f"{s['followed']} of {s['judged']} days matched the verdict "
                    f"({s['followed_pct']}%).")
-    # The one case worth naming on its own.
-    if s["exceeded"]:
-        hard_over_rest = [r for r in rows
-                          if r.get("adherence") == "exceeded"
-                          and r.get("level") in ("rest", "recovery")]
-        if hard_over_rest:
-            days = ", ".join(r["calendar_date"] for r in hard_over_rest[:3])
-            out.append(f"{len(hard_over_rest)} day(s) went hard against a rest or "
-                       f"recovery verdict: {days}"
-                       + ("…" if len(hard_over_rest) > 3 else "") + ".")
+    # The one case worth naming on its own — and it has to BE that case. An easy
+    # session against a recovery verdict also counts as "exceeded", and calling
+    # that "went hard" overstates it. Only a hard day earns the sentence.
+    hard_over_rest = [r for r in rows
+                      if r.get("done") == "hard"
+                      and r.get("level") in ("rest", "recovery")]
+    if hard_over_rest:
+        days = ", ".join(r["calendar_date"] for r in hard_over_rest[:3])
+        out.append(f"{len(hard_over_rest)} day(s) went hard against a rest or "
+                   f"recovery verdict: {days}"
+                   + ("…" if len(hard_over_rest) > 3 else "") + ".")
+    # Everything else that went over is counted, not dramatised.
+    milder = s["exceeded"] - len(hard_over_rest)
+    if milder > 0:
+        out.append(f"{milder} further day(s) went beyond the verdict without "
+                   "going hard.")
     for said in ("rest", "hard"):
         slot = s["by_said"].get(said)
         if slot and slot["days"] >= 3:
