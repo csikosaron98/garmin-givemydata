@@ -283,6 +283,8 @@ class Goal:
     race_date: str | None = None
     category: str | None = None
     target: str | None = None
+    result: str | None = None
+    result_note: str | None = None
     priority: int = 2
     active: bool = True
     created: str = ""
@@ -300,6 +302,7 @@ def _row_to_goal(row) -> Goal:
         goal_id=row["goal_id"], kind=row["kind"], name=row["name"],
         discipline=row["discipline"], standing=row["standing"],
         race_date=row["race_date"], category=row["category"], target=row["target"],
+        result=row["result"], result_note=row["result_note"],
         priority=row["priority"], active=bool(row["active"]),
         created=row["created"], notes=row["notes"])
 
@@ -327,11 +330,12 @@ def add_goal(conn: sqlite3.Connection, goal: Goal) -> int:
     created = goal.created or _dt.date.today().isoformat()
     cur = conn.execute(
         "INSERT INTO training_goal (kind, name, discipline, standing, race_date, "
-        "category, target, priority, active, created, notes) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "category, target, result, result_note, priority, active, created, notes) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (goal.kind, goal.name.strip(), goal.discipline, goal.standing,
-         goal.race_date, goal.category, goal.target, goal.priority,
-         1 if goal.active else 0, created, goal.notes))
+         goal.race_date, goal.category, goal.target, goal.result,
+         goal.result_note, goal.priority, 1 if goal.active else 0, created,
+         goal.notes))
     conn.commit()
     return int(cur.lastrowid)
 
@@ -353,7 +357,7 @@ def update_goal(conn: sqlite3.Connection, goal_id: int, **fields) -> bool:
     entered, or the format of it written down.
     """
     allowed = ("name", "target", "notes", "priority", "race_date", "discipline",
-               "standing", "category")
+               "standing", "category", "result", "result_note")
     bad = sorted(set(fields) - set(allowed))
     if bad:
         raise ValueError(f"cannot set {bad}; only {allowed}")
@@ -515,6 +519,114 @@ def gaps(summary: dict, target: WeeklyTarget) -> list[Gap]:
 
 def met(summary: dict, target: WeeklyTarget) -> bool:
     return not gaps(summary, target)
+
+
+# ---------------------------------------------------------------------------
+# what actually happened
+# ---------------------------------------------------------------------------
+# A goal carried a target and nothing to score it against. Retiring a race hid it
+# rather than closing it, so the system could not say whether a block had worked,
+# and the next block's targets could only be argued from the literature.
+#
+# The result is free text, because "DNF", "66:12 doubles" and "1:24:38 (22,7 km
+# mért táv)" are all real answers. Where both the target and the result parse as a
+# time, they are compared; where they do not, the result is still recorded and
+# simply not scored. A comparison that needed a tidy value would have thrown away
+# the untidy ones, which are the interesting races.
+
+_TIME_RE = _re.compile(r"^\s*(?:(\d{1,2}):)?(\d{1,3}):([0-5]\d)\s*$")
+
+
+def parse_time(text: str | None) -> int | None:
+    """Seconds from "1:24:38" or "66:12". None when it is not a plain time.
+
+    Minutes above 59 are accepted in the two-part form, because a Hyrox time is
+    written "66:12" and nobody writes "1:06:12" for it.
+    """
+    if not text:
+        return None
+    m = _TIME_RE.match(str(text))
+    if not m:
+        return None
+    hours, minutes, seconds = m.group(1), int(m.group(2)), int(m.group(3))
+    return (int(hours) * 3600 if hours else 0) + minutes * 60 + seconds
+
+
+def fmt_seconds(total: int) -> str:
+    sign = "-" if total < 0 else ""
+    total = abs(int(total))
+    h, rest = divmod(total, 3600)
+    m, s = divmod(rest, 60)
+    return f"{sign}{h}:{m:02d}:{s:02d}" if h else f"{sign}{m}:{s:02d}"
+
+
+def beat_target(goal: Goal | None) -> bool | None:
+    """True, False, or None when there is nothing to compare.
+
+    None is not a failure: a race with no target, or a result like "DNF", is a
+    perfectly good record — it just cannot be scored.
+    """
+    if not goal:
+        return None
+    want, got = parse_time(goal.target), parse_time(goal.result)
+    if want is None or got is None:
+        return None
+    return got <= want
+
+
+def describe_result(goal: Goal | None) -> str:
+    """One line: what was aimed at, what happened, and the gap."""
+    if not goal or not goal.result:
+        return ""
+    bits = [f"Result: {goal.result}"]
+    want, got = parse_time(goal.target), parse_time(goal.result)
+    if want is not None and got is not None:
+        delta = got - want
+        if delta == 0:
+            bits.append(f"exactly the {goal.target} target")
+        else:
+            bits.append(f"{fmt_seconds(abs(delta))} "
+                        f"{'under' if delta < 0 else 'over'} the {goal.target} target")
+    elif goal.target:
+        bits.append(f"against a target of {goal.target}")
+    if goal.result_note:
+        bits.append(goal.result_note)
+    return " — ".join(bits) + "."
+
+
+def record_result(conn: sqlite3.Connection, goal_id: int, result: str,
+                  note: str | None = None, *, retire: bool = True) -> bool:
+    """Store what happened, and close the race.
+
+    Retires by default: a race with a result is over, and leaving it driving the
+    week afterwards is the bug that made this worth building.
+    """
+    if not (result or "").strip():
+        raise ValueError("a result needs something in it")
+    changed = update_goal(conn, goal_id, result=result.strip(), result_note=note)
+    if changed and retire:
+        retire_goal(conn, goal_id)
+    return changed
+
+
+def race_prediction(conn: sqlite3.Connection, goal: Goal | None) -> dict | None:
+    """Garmin's own prediction for the race's distance, as it stood on the day.
+
+    His own data, recorded before the race and never looked at again — which is
+    the other half of "did the block work". Only running has predictions.
+    """
+    if not goal or not goal.race_date or goal.discipline != "running":
+        return None
+    row = conn.execute(
+        "SELECT calendar_date, time_5k, time_10k, time_half_marathon, time_marathon "
+        "FROM race_predictions WHERE calendar_date <= ? "
+        "ORDER BY calendar_date DESC LIMIT 1", (goal.race_date,)).fetchone()
+    if not row:
+        return None
+    keys = ("5k", "10k", "half_marathon", "marathon")
+    return {"as_of": row[0],
+            **{k: (int(row[i + 1]) if row[i + 1] is not None else None)
+               for i, k in enumerate(keys)}}
 
 
 # ---------------------------------------------------------------------------
@@ -846,6 +958,11 @@ def _fmt_goal(g: Goal, date: str) -> str:
         head += f"  {spec['label'] if spec else g.category}"
     if g.target:
         head += f"  target {g.target}"
+    if g.result:
+        head += f"  → {g.result}"
+        won = beat_target(g)
+        if won is not None:
+            head += " ✓" if won else " ✗"
     if not g.active:
         head += "  [retired]"
     return head
@@ -896,6 +1013,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--priority", type=int, default=None)
     p.add_argument("--race-date", dest="race_date", default=None)
     p.add_argument("--category", default=None)
+
+    p = sub.add_parser("result", help="record what happened, and close the race")
+    p.add_argument("goal_id", type=int)
+    p.add_argument("result", help="e.g. 1:24:38, 66:12, DNF")
+    p.add_argument("--note", default=None, help="anything else about how it went")
+    p.add_argument("--keep-active", action="store_true",
+                   help="do not retire it (unusual: a race with a result is over)")
 
     p = sub.add_parser("retire", help="deactivate a goal, keeping its history")
     p.add_argument("goal_id", type=int)
@@ -952,6 +1076,24 @@ def main(argv: list[str] | None = None) -> int:
                 print("Updated:" + _fmt_goal(g, today))
                 if g.notes:
                     print(f"    notes: {g.notes}")
+        return 0
+
+    if a.cmd == "result":
+        if not record_result(conn, a.goal_id, a.result, a.note,
+                             retire=not a.keep_active):
+            print(f"No goal with id {a.goal_id}.")
+            return 0
+        goal = [g for g in all_goals(conn, include_retired=True)
+                if g.goal_id == a.goal_id][0]
+        print(f"[{a.goal_id}] {goal.name}: {describe_result(goal)}")
+        pred = race_prediction(conn, goal)
+        if pred:
+            # His own data, recorded before the race and never looked at again.
+            key = {"running": "half_marathon"}.get(goal.discipline)
+            secs = pred.get(key) if key else None
+            if secs:
+                print(f"    Garmin predicted {fmt_seconds(secs)} for the half "
+                      f"marathon as of {pred['as_of']}.")
         return 0
 
     if a.cmd == "retire":

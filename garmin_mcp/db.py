@@ -807,6 +807,8 @@ CREATE TABLE IF NOT EXISTS training_goal (
     standing    TEXT,                   -- maintenance | strength | muscle | fat_loss
     race_date   TEXT,                   -- ISO date, races only
     category    TEXT,                   -- hyrox: open | pro | doubles | doubles_pro | relay
+    result      TEXT,                   -- what was achieved: '1:24:38', '66:12', 'DNF'
+    result_note TEXT,                   -- anything else about how it went
     target      TEXT,                   -- free text, e.g. '65:00', 'sub-3:30'
     priority    INTEGER NOT NULL DEFAULT 2,   -- 1 = A race, 2 = B, 3 = C
     active      INTEGER NOT NULL DEFAULT 1,
@@ -951,7 +953,15 @@ def migrate_training_goal_table(conn: sqlite3.Connection) -> None:
     disagree. Existing rows get NULL, which the targets read as the standard
     division, so nothing changes for a goal entered before this column existed.
     """
-    _add_columns(conn, "training_goal", [("category", "TEXT")])
+    _add_columns(conn, "training_goal", [
+        ("category", "TEXT"),
+        # What actually happened. A goal carried a target and nothing to score it
+        # against, so retiring a race hid it rather than closing it — and the next
+        # block's targets could only be argued from the literature, never from his
+        # own races.
+        ("result", "TEXT"),
+        ("result_note", "TEXT"),
+    ])
 
 
 def migrate_hrv_table(conn: sqlite3.Connection) -> None:

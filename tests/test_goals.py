@@ -837,3 +837,181 @@ def test_the_advice_explains_the_category(db):
                       race_date="2027-01-01", priority=1, category="doubles"))
     out = " ".join(observations(_week(db), driving_goal(db, "2026-10-03"), "2026-10-03"))
     assert "Doubles" in out and "8 km" in out
+
+
+# ---- what actually happened ------------------------------------------------
+# A goal carried a target and nothing to score it against: retiring a race hid it
+# rather than closing it. Áron had already started working around it by typing
+# "PB futása" into the notes field.
+
+from garmin_mcp.goals import (  # noqa: E402
+    beat_target,
+    describe_result,
+    fmt_seconds,
+    parse_time,
+    race_prediction,
+    record_result,
+)
+
+
+@pytest.mark.parametrize("text,seconds", [
+    ("1:24:38", 5078),
+    ("66:12", 3972),          # a Hyrox time; nobody writes 1:06:12 for it
+    ("0:59", 59),
+    ("  1:26:30  ", 5190),
+])
+def test_a_plain_time_parses(text, seconds):
+    assert parse_time(text) == seconds
+
+
+@pytest.mark.parametrize("text", [
+    None, "", "DNF", "about an hour", "1:2:3:4", "66:99", "sub-3:30", "75 kg",
+])
+def test_anything_else_is_not_a_time(text):
+    """None is the honest answer. A comparison that needed a tidy value would
+    have thrown away the untidy races, which are the interesting ones."""
+    assert parse_time(text) is None
+
+
+def test_the_result_is_scored_where_both_sides_are_times(db):
+    g = Goal(kind="race", name="Spar", discipline="running", race_date="2026-10-11",
+             target="1:26:30", result="1:24:38")
+    assert beat_target(g) is True
+    line = describe_result(g)
+    assert "1:24:38" in line and "1:52 under" in line and "1:26:30" in line
+
+
+def test_a_missed_target_says_so(db):
+    g = Goal(kind="race", name="Hyrox", discipline="hyrox", race_date="2026-10-17",
+             target="64:00", result="66:12")
+    assert beat_target(g) is False
+    assert "2:12 over" in describe_result(g)
+
+
+def test_exactly_on_target_counts_as_met(db):
+    g = Goal(kind="race", name="x", discipline="running", race_date="2026-10-11",
+             target="1:26:30", result="1:26:30")
+    assert beat_target(g) is True
+    assert "exactly" in describe_result(g)
+
+
+def test_an_unscoreable_result_is_still_recorded(db):
+    """"DNF" is a real answer, and losing it would be worse than not scoring it."""
+    g = Goal(kind="race", name="x", discipline="running", race_date="2026-10-11",
+             target="1:26:30", result="DNF")
+    assert beat_target(g) is None
+    assert "DNF" in describe_result(g) and "1:26:30" in describe_result(g)
+
+
+def test_a_race_with_no_target_is_recorded_and_not_scored(db):
+    g = Goal(kind="race", name="x", discipline="hyrox", race_date="2026-10-17",
+             result="66:12")
+    assert beat_target(g) is None
+    assert describe_result(g) == "Result: 66:12."
+
+
+def test_no_result_says_nothing(db):
+    assert describe_result(Goal(kind="race", name="x", target="1:26:30")) == ""
+    assert describe_result(None) == ""
+    assert beat_target(None) is None
+
+
+def test_the_note_is_carried_into_the_line(db):
+    g = Goal(kind="race", name="x", discipline="running", race_date="2026-10-11",
+             target="1:26:30", result="1:24:38", result_note="PB, 22,7 km mért táv")
+    assert "22,7 km" in describe_result(g)
+
+
+@pytest.mark.parametrize("seconds,text", [
+    (5078, "1:24:38"), (3972, "1:06:12"), (112, "1:52"), (0, "0:00"), (-112, "-1:52"),
+])
+def test_seconds_are_formatted_as_hours_minutes_seconds(seconds, text):
+    """Deliberately asymmetric with parse_time: the input accepts "66:12" because
+    that is how a Hyrox time is written, while the output normalises to 1:06:12.
+    fmt_seconds exists for the gap between a target and a result, where hours are
+    the right unit and sixty-six minutes would read as a mistake."""
+    assert fmt_seconds(seconds) == text
+
+
+def test_the_parser_accepts_what_the_formatter_would_not_write():
+    assert parse_time("66:12") == parse_time("1:06:12") == 3972
+
+
+def test_recording_a_result_closes_the_race(db):
+    """A race with a result is over. Leaving it driving the week afterwards is the
+    bug that made this worth building."""
+    gid = race(db, name="Spar", date="2026-10-11", discipline="running",
+               target="1:26:30", priority=1)
+    assert record_result(db, gid, "1:24:38", "PB") is True
+    g = [x for x in all_goals(db, include_retired=True) if x.goal_id == gid][0]
+    assert g.result == "1:24:38" and g.result_note == "PB"
+    assert g.active is False, "it is closed, not merely annotated"
+    assert all_goals(db) == [], "and it drives nothing"
+
+
+def test_a_result_can_be_recorded_without_closing(db):
+    gid = race(db, date="2026-10-11")
+    assert record_result(db, gid, "1:24:38", retire=False) is True
+    assert [x for x in all_goals(db) if x.goal_id == gid], "still active"
+
+
+def test_an_empty_result_is_refused(db):
+    gid = race(db, date="2026-10-11")
+    with pytest.raises(ValueError, match="result"):
+        record_result(db, gid, "   ")
+
+
+def test_recording_against_a_goal_that_is_not_there(db):
+    assert record_result(db, 9999, "1:24:38") is False
+
+
+def test_the_result_survives_a_round_trip_through_the_store(db):
+    gid = add_goal(db, Goal(kind="race", name="Roma Hyrox", discipline="hyrox",
+                            race_date="2026-09-27", category="doubles",
+                            target="66:44", result="66:30",
+                            result_note="Levivel, az első Hyrox"))
+    g = [x for x in all_goals(db, include_retired=True) if x.goal_id == gid][0]
+    assert g.result == "66:30" and "Levivel" in g.result_note
+    assert beat_target(g) is True, "66:30 beats 66:44"
+
+
+# ---- Garmin's own prediction, as it stood on the day -----------------------
+
+def test_the_prediction_for_the_race_date_is_found(db):
+    db.execute("INSERT INTO race_predictions (calendar_date, time_5k, time_10k, "
+               "time_half_marathon, time_marathon) VALUES (?,?,?,?,?)",
+               ("2026-10-11", 1025, 2218, 5014, 10931))
+    db.commit()
+    g = Goal(kind="race", name="Spar", discipline="running", race_date="2026-10-11")
+    p = race_prediction(db, g)
+    assert p["as_of"] == "2026-10-11" and p["half_marathon"] == 5014
+
+
+def test_the_nearest_earlier_prediction_is_used(db):
+    """A race day with no row of its own still has the last one before it."""
+    db.execute("INSERT INTO race_predictions (calendar_date, time_half_marathon) "
+               "VALUES ('2026-10-08', 5100)")
+    db.commit()
+    g = Goal(kind="race", name="x", discipline="running", race_date="2026-10-11")
+    assert race_prediction(db, g)["as_of"] == "2026-10-08"
+
+
+def test_a_later_prediction_is_never_used(db):
+    """It would be hindsight dressed as a forecast."""
+    db.execute("INSERT INTO race_predictions (calendar_date, time_half_marathon) "
+               "VALUES ('2026-10-20', 4900)")
+    db.commit()
+    g = Goal(kind="race", name="x", discipline="running", race_date="2026-10-11")
+    assert race_prediction(db, g) is None
+
+
+def test_only_running_has_predictions(db):
+    """Garmin forecasts no Hyrox time, and inventing one would be the worst kind
+    of made-up number: plausible."""
+    db.execute("INSERT INTO race_predictions (calendar_date, time_half_marathon) "
+               "VALUES ('2026-10-17', 5014)")
+    db.commit()
+    assert race_prediction(db, Goal(kind="race", name="x", discipline="hyrox",
+                                    race_date="2026-10-17")) is None
+    assert race_prediction(db, Goal(kind="standing", name="m", standing="maintenance")) is None
+    assert race_prediction(db, None) is None

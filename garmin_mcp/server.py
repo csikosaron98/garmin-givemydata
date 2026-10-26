@@ -3055,7 +3055,10 @@ def garmin_training_goals() -> str:
                         "goal_id": g.goal_id, "kind": g.kind, "name": g.name,
                         "discipline": g.discipline, "standing": g.standing,
                         "race_date": g.race_date, "category": g.category,
-                        "target": g.target,
+                        "target": g.target, "result": g.result,
+                        "result_note": g.result_note,
+                        "beat_target": _goals.beat_target(g),
+                        "result_line": _goals.describe_result(g),
                         "priority": g.priority, "active": g.active,
                         "created": g.created, "notes": g.notes,
                         "label": g.label,
@@ -3094,6 +3097,8 @@ def garmin_goal_write(
     race_date: str | None = None,
     category: str | None = None,
     target: str | None = None,
+    result: str | None = None,
+    result_note: str | None = None,
     priority: int | None = None,
     notes: str | None = None,
 ) -> str:
@@ -3105,15 +3110,17 @@ def garmin_goal_write(
     *discipline* + *race_date* for a race, or *standing* for a standing goal.
     *category* is the race's division where its discipline defines one — for a
     HYROX: ``open``, ``pro``, ``doubles``, ``doubles_pro`` or ``relay``.
-    ``update`` and ``retire`` need *goal_id*.
+    ``update`` and ``retire`` need *goal_id*. ``result`` needs *goal_id* and
+    *result* — what actually happened ("1:24:38", "66:12", "DNF") — and closes
+    the race, because a race with a result is over.
 
     Writes only the `training_goal` table, takes no SQL, and validates through the
     same code the command line uses. Retiring deactivates rather than deletes.
     """
     from . import goals as _goals
 
-    if action not in ("add", "update", "retire"):
-        return json.dumps({"error": "action must be add, update or retire"})
+    if action not in ("add", "update", "retire", "result"):
+        return json.dumps({"error": "action must be add, update, retire or result"})
 
     conn = get_connection()
     try:
@@ -3129,6 +3136,14 @@ def garmin_goal_write(
         if goal_id is None:
             return json.dumps({"error": f"{action} needs goal_id"})
 
+        if action == "result":
+            if not result:
+                return json.dumps({"error": "result needs a result"})
+            done = _goals.record_result(conn, int(goal_id), result, result_note)
+            log.info("garmin_goal_write result goal_id=%s found=%s", goal_id, done)
+            return json.dumps({"ok": done, "action": "result", "goal_id": goal_id}
+                              if done else {"error": f"no goal with id {goal_id}"})
+
         if action == "retire":
             done = _goals.retire_goal(conn, int(goal_id))
             log.info("garmin_goal_write retire goal_id=%s found=%s", goal_id, done)
@@ -3138,7 +3153,8 @@ def garmin_goal_write(
         done = _goals.update_goal(
             conn, int(goal_id), name=name, target=target, notes=notes,
             priority=priority, race_date=race_date, discipline=discipline,
-            standing=standing, category=category)
+            standing=standing, category=category, result=result,
+            result_note=result_note)
         log.info("garmin_goal_write update goal_id=%s changed=%s", goal_id, done)
         return json.dumps({"ok": done, "action": "update", "goal_id": goal_id}
                           if done else {"error": "nothing to change, or no such goal"})
